@@ -1,0 +1,8 @@
+node_modules/
+playwright-profile/
+urls.txt
+urls.log
+*.tmp
+videos.json
+process.log
+.env
