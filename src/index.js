@@ -113,6 +113,10 @@ async function main() {
   });
 
   const page = context.pages()[0] ?? await context.newPage();
+  page.on('close', () => {
+    console.log('\n[info] Browser closed manually. Exiting...');
+    process.exit(0);
+  });
   page.on('pageerror', (error) => logDetail(`[pageerror] ${error.message}`));
   page.on('crash', () => logDetail('[pageerror] Page crashed'));
 
@@ -126,14 +130,14 @@ async function main() {
   });
 
   if (!options.autoLessons && !options.crawlLearningPage && options.waitForEnter) {
-    console.log('[pause] Kalau belum login, login dulu di browser Playwright.');
-    console.log('[pause] Kalau sudah login dan halaman course sudah siap, tekan Enter di CMD.');
+    console.log('[pause] If you are not logged in, please log in manually in the Playwright browser.');
+    console.log('[pause] Once logged in and the course page is ready, press Enter in the terminal.');
     await waitForEnter();
   } else if (options.crawlLearningPage) {
     logClean('\n=============================================');
-    logClean('[pause] Mode --crawl-learning-page aktif.');
-    logClean('[pause] Pastikan Anda sudah login dan berada di halaman Learning (halaman dengan Menu Sidebar).');
-    logClean('[pause] Tekan Enter di CMD untuk mulai crawling.');
+    logClean('[pause] Mode --crawl-learning-page active.');
+    logClean('[pause] Ensure you are logged in and on the Learning page (with the Sidebar Menu).');
+    logClean('[pause] Press Enter in the terminal to start crawling.');
     logClean('=============================================\n');
     await waitForEnter();
   }
@@ -145,7 +149,7 @@ async function main() {
     await processLessons(page);
     console.log('[done] Auto lesson processing finished. Browser remains open for inspection. Press Ctrl+C to stop.');
   } else {
-    console.log('[ready] Monitoring aktif. Klik lesson/video manual di browser. Press Ctrl+C to stop.');
+    console.log('[ready] Monitoring active. Click lesson/video manually in the browser. Press Ctrl+C to stop.');
   }
 
   await new Promise(() => {});
@@ -158,7 +162,7 @@ async function waitForEnter() {
   });
 
   try {
-    await rl.question('Tekan Enter untuk mulai monitor .m3u8... ');
+    await rl.question('Press Enter to start monitoring .m3u8... ');
   } finally {
     rl.close();
   }
@@ -214,20 +218,21 @@ async function attachUrlToActiveLesson({ url, timestamp, source, status, content
 
   if (options.crawlLearningPage) {
     lesson.videos ??= [];
-    const videoIndex = activeCapture.videoIndex || 1;
-    const existingVideo = lesson.videos.find((v) => v.videoIndex === videoIndex && v.m3u8Url === url);
+    const streamIndex = lesson.videos.length + 1;
+    const existingVideo = lesson.videos.find((v) => v.m3u8Url === url);
     if (existingVideo) return;
     
     lesson.videos.push({
-      videoIndex,
-      videoTitle: `${lesson.lessonTitle} - Video ${videoIndex}`,
+      videoIndex: streamIndex,
+      videoTitle: `${lesson.lessonTitle} - Stream ${streamIndex}`,
       m3u8Url: url,
       timestamp,
       source,
       status,
       contentType
     });
-    lesson.status = 'completed';
+    // Let the main flow handle setting status='completed' 
+    // to avoid premature completion if we want to wait for more streams.
     lesson.hasVideo = true;
   } else {
     if (lesson.m3u8Urls.includes(url)) return;
@@ -498,7 +503,7 @@ async function waitForCaptureWindow(capture) {
   const deadline = Date.now() + options.captureWindowMs;
   while (Date.now() < deadline) {
     if (capture.foundUrls.size > 0) {
-      await new Promise((resolve) => setTimeout(resolve, 1200));
+      await new Promise((resolve) => setTimeout(resolve, options.afterFirstHitGraceMs));
       return;
     }
     await new Promise((resolve) => setTimeout(resolve, 500));
@@ -548,6 +553,7 @@ async function loadVideosState() {
       for (const mod of parsed.modules) {
         mod.lessons ??= [];
         for (const lesson of mod.lessons) {
+          if (lesson.status === 'error') lesson.status = 'failed';
           lesson.videos ??= [];
           for (const video of lesson.videos) {
             foundUrls.add(video.m3u8Url);
@@ -639,10 +645,12 @@ function parseArgs(args) {
     crawlLearningPage: process.env.CRAWL_LEARNING_PAGE === '1' || process.env.CRAWL_LEARNING_PAGE === 'true',
     waitForEnter: process.env.WAIT_FOR_ENTER !== '0' && process.env.WAIT_FOR_ENTER !== 'false',
     resume: process.env.RESUME_CAPTURE !== '0' && process.env.RESUME_CAPTURE !== 'false',
+    retryNoVideo: process.env.RETRY_NO_VIDEO === '1' || process.env.RETRY_NO_VIDEO === 'true',
     maxAttempts: Number(process.env.MAX_ATTEMPTS || 3),
     initialSettleMs: Number(process.env.INITIAL_SETTLE_MS || 5000),
     lessonLoadTimeoutMs: Number(process.env.LESSON_LOAD_TIMEOUT_MS || 5000),
     captureWindowMs: Number(process.env.CAPTURE_WINDOW_MS || 20000),
+    afterFirstHitGraceMs: Number(process.env.AFTER_FIRST_HIT_GRACE_MS || 5000),
     betweenLessonDelayMs: Number(process.env.BETWEEN_LESSON_DELAY_MS || 1500),
     retryDelayMs: Number(process.env.RETRY_DELAY_MS || 1500),
     discoveryScrolls: Number(process.env.DISCOVERY_SCROLLS || 8),
@@ -666,6 +674,8 @@ function parseArgs(args) {
       parsed.resume = false;
     } else if (arg === '--resume') {
       parsed.resume = true;
+    } else if (arg === '--retry-no-video') {
+      parsed.retryNoVideo = true;
     } else if (arg === '--url' && next) {
       parsed.courseUrl = next;
       index += 1;
@@ -676,6 +686,21 @@ function parseArgs(args) {
       index += 1;
     } else if (arg.startsWith('--profile-dir=')) {
       parsed.profileDir = arg.slice('--profile-dir='.length);
+    } else if (arg === '--videos-file' && next) {
+      parsed.videosFile = next;
+      index += 1;
+    } else if (arg.startsWith('--videos-file=')) {
+      parsed.videosFile = arg.slice('--videos-file='.length);
+    } else if (arg === '--log-file' && next) {
+      parsed.logFile = next;
+      index += 1;
+    } else if (arg.startsWith('--log-file=')) {
+      parsed.logFile = arg.slice('--log-file='.length);
+    } else if (arg === '--after-first-hit-grace-ms' && next) {
+      parsed.afterFirstHitGraceMs = Number(next);
+      index += 1;
+    } else if (arg.startsWith('--after-first-hit-grace-ms=')) {
+      parsed.afterFirstHitGraceMs = Number(arg.slice('--after-first-hit-grace-ms='.length));
     } else if (arg === '--channel' && next) {
       parsed.channel = next;
       index += 1;
@@ -704,7 +729,7 @@ function parseArgs(args) {
     }
   }
 
-  for (const key of ['navigationTimeoutMs', 'maxAttempts', 'initialSettleMs', 'lessonLoadTimeoutMs', 'captureWindowMs', 'betweenLessonDelayMs', 'retryDelayMs', 'discoveryScrolls']) {
+  for (const key of ['navigationTimeoutMs', 'maxAttempts', 'initialSettleMs', 'lessonLoadTimeoutMs', 'captureWindowMs', 'afterFirstHitGraceMs', 'betweenLessonDelayMs', 'retryDelayMs', 'discoveryScrolls']) {
     if (!Number.isFinite(parsed[key]) || parsed[key] <= 0) {
       throw new Error(`${key} must be a positive number.`);
     }
@@ -715,6 +740,7 @@ function parseArgs(args) {
 
 function printHelpAndExit(exitCode = 0) {
   console.log(`Usage:
+  npm run crawl -- --url <course-url>
   npm start -- --url <course-url>
   npm run start:debug -- --url <course-url>
   npm start -- --url <course-url> --auto-lessons
@@ -722,29 +748,26 @@ function printHelpAndExit(exitCode = 0) {
 Options:
   --url <url>             Huawei course page to open
   --debug                 Print request URL, response URL, status, and content-type
-  --crawl-learning-page   Crawl learning page iteratively using sidebar hierarchy
-  --auto-lessons          Discover and click lesson candidates automatically
+  --crawl-learning-page   Parse sidebar menu hierarchically and crawl lessons automatically
+  --auto-lessons          Discover and click lesson candidates automatically (Legacy)
   --no-wait               Do not wait for Enter before manual monitoring
   --resume                Resume from videos.json, default: enabled
   --no-resume             Ignore existing videos.json and rebuild state
+  --retry-no-video        Retry lessons marked as no_video on resume
   --max-attempts <n>      Retry attempts per lesson, default: 3
   --capture-window-ms <n> Wait time for HLS after clicking lesson, default: 20000
-  --lesson-load-timeout-ms <n> Wait after clicking lesson before play/capture, default: 5000
+  --after-first-hit-grace-ms <n> Extra wait time after first m3u8 is found, default: 5000
+  --lesson-load-timeout-ms <n> Wait after clicking lesson before capture, default: 5000
   --profile-dir <path>    Persistent browser profile directory, default: playwright-profile
-  --channel <name>        Optional Playwright browser channel, for example: chrome or msedge
+  --videos-file <path>    Custom output path for videos metadata, default: videos.json
+  --log-file <path>       Custom output path for URL logs, default: urls.log
+  --channel <name>        Optional browser channel, for example: chrome or msedge
 
-Environment:
-  COURSE_URL              Default course URL if --url is not passed
-  DEBUG_HLS_CAPTURE       Set to 1 or true to enable debug mode
-  PROFILE_DIR             Persistent browser profile directory
-  URLS_FILE               Output file for unique HLS URLs
-  LOG_FILE                Timestamped log file
-  VIDEOS_FILE             Output file for lesson metadata, default: videos.json
-  AUTO_LESSONS            Set to 1 or true to enable auto lesson mode
-  WAIT_FOR_ENTER          Set to 0 or false to start manual monitoring immediately
-  RESUME_CAPTURE          Set to 0 or false to disable resume
-  NAVIGATION_TIMEOUT_MS   Initial page navigation timeout, default: 60000
-  PLAYWRIGHT_CHANNEL      Optional browser channel
+Environment Variables:
+  COURSE_URL, DEBUG_HLS_CAPTURE, PROFILE_DIR, LOG_FILE, VIDEOS_FILE,
+  AUTO_LESSONS, CRAWL_LEARNING_PAGE, WAIT_FOR_ENTER, RESUME_CAPTURE, RETRY_NO_VIDEO,
+  MAX_ATTEMPTS, INITIAL_SETTLE_MS, LESSON_LOAD_TIMEOUT_MS, CAPTURE_WINDOW_MS, AFTER_FIRST_HIT_GRACE_MS,
+  BETWEEN_LESSON_DELAY_MS, RETRY_DELAY_MS, DISCOVERY_SCROLLS, NAVIGATION_TIMEOUT_MS, PLAYWRIGHT_CHANNEL
 `);
   process.exit(exitCode);
 }
@@ -756,25 +779,24 @@ async function crawlLearningPageFlow(page) {
   await appendFile(logFile, `\n===== START SESSION [${toWIB()}] =====\n`, 'utf8').catch(() => {});
   videosState = await loadVideosState();
   logDetail('[crawl] Waiting for course UI to settle...');
-  await page.waitForLoadState('domcontentloaded').catch(() => {});
   await page.waitForTimeout(options.initialSettleMs);
 
-  logClean('[crawl] Membuka semua daftar BAB/Module di sidebar...');
-  const successExpand = await expandSidebarItems(page);
-  if (!successExpand) {
-    logError('[crawl] Gagal menemukan sidebar. Pastikan Anda berada di halaman materi.');
+  logClean('[crawl] Expanding all Modules/Sections in sidebar...');
+  const sidebarExists = await expandSidebarItems(page);
+  if (!sidebarExists) {
+    logError('[crawl] Failed to find sidebar. Ensure you are on the course material page.');
     logClean('\n============================== END CRAWL SESSION ==============================\n');
     return;
   }
 
   logDetail('[crawl] Building hierarchy from sidebar...');
   const modules = await buildSidebarHierarchy(page);
-  mergeHierarchicalModules(modules);
+  videosState.modules = modules;
   await saveVideosState();
 
-  const totalLessons = videosState.modules.reduce((acc, mod) => acc + mod.lessons.length, 0);
-  logClean(`[crawl] Berhasil menemukan ${videosState.modules.length} BAB dengan total ${totalLessons} lesson.`);
-  logClean('\n--- MEMULAI CRAWLING ---');
+  const totalLessons = modules.reduce((sum, m) => sum + m.lessons.length, 0);
+  logClean(`[crawl] Successfully found ${videosState.modules.length} Modules with a total of ${totalLessons} lessons.`);
+  logClean('\n--- CRAWLING STARTED ---');
   
   if (totalLessons === 0) {
     console.error('[crawl] No lessons found in the sidebar. Please verify the UI state.');
@@ -823,10 +845,11 @@ async function expandSidebarItems(page) {
                  return p;
              }
          }
-         return document.body;
+         return null;
       };
       
       const sidebar = getSidebar();
+      if (!sidebar) return false;
       const nodes = Array.from(sidebar.querySelectorAll('[aria-expanded="false"], i[class*="arrow"], i[class*="caret"], .expand-icon, [class*="expand"]'));
       
       for (const node of nodes) {
@@ -848,14 +871,10 @@ async function expandSidebarItems(page) {
       return count;
     });
 
+    if (newlyExpanded === false) return false;
     if (newlyExpanded === 0) break;
     expandedCount += newlyExpanded;
     await page.waitForTimeout(1500);
-  }
-  
-  if (expandedCount === 0) {
-     const lessonsCount = await targetFrame.evaluate(() => document.querySelectorAll('li, [role="treeitem"]').length);
-     if (lessonsCount < 5) return false;
   }
   
   logClean(`[crawl] Expanded ${expandedCount} items in sidebar.`);
@@ -890,10 +909,11 @@ async function buildSidebarHierarchy(page) {
                  return p;
              }
          }
-         return document.body;
+         return null;
     };
     
     const sidebar = getSidebar();
+    if (!sidebar) return [];
     const modules = [];
     const nodes = Array.from(sidebar.querySelectorAll('[role="treeitem"], li, .el-menu-item, .el-submenu__title, .tree-node'));
     let currentModule = null;
@@ -947,9 +967,10 @@ async function buildSidebarHierarchy(page) {
          
          const lastLesson = currentModule.lessons[currentModule.lessons.length - 1];
          if (!lastLesson || lastLesson.lessonTitle !== text) {
-             // Generate a stable ID based on text
+             // Generate a stable ID based on module, lesson title, and length
              let hash = 0;
-             for (let i = 0; i < text.length; i++) { hash = Math.imul(31, hash) + text.charCodeAt(i) | 0; }
+             const fText = `${currentModule.moduleTitle}|${text}|${currentModule.lessons.length}`;
+             for (let i = 0; i < fText.length; i++) { hash = Math.imul(31, hash) + fText.charCodeAt(i) | 0; }
              const fingerprint = `lesson-${Math.abs(hash)}`;
              
              // To get the exact selector
@@ -1028,7 +1049,7 @@ async function processHierarchicalLessons(page) {
   for (const module of videosState.modules) {
     logClean(`\n[BAB] ${module.moduleTitle}`);
     for (const lesson of module.lessons) {
-      if (options.resume && (lesson.status === 'completed' || lesson.status === 'no_video')) {
+      if (options.resume && (lesson.status === 'completed' || (lesson.status === 'no_video' && !options.retryNoVideo))) {
         logClean(`  [-] ${lesson.lessonTitle} -> (Skipped, already ${lesson.status})`);
         logDetail(`Skipped ${lesson.lessonTitle} because status is ${lesson.status}`);
         continue;
@@ -1041,53 +1062,70 @@ async function processHierarchicalLessons(page) {
 }
 
 async function processHierarchicalLesson(page, lesson) {
-  lesson.status = 'in_progress';
-  lesson.error = null;
-  lesson.attempts = (lesson.attempts || 0) + 1;
-  await saveVideosState();
-
-  try {
-    // Set activeCapture BEFORE clicking so network interceptor catches m3u8 during page load
-    activeCapture = {
-      lessonId: lesson.lessonId,
-      videoIndex: 1,
-      startedAt: Date.now(),
-      foundUrls: new Set()
-    };
-
-    // Re-expand sidebar because Huawei collapses other BABs/sub-BABs after each click
-    await expandSidebarItems(page);
-
-    const clicked = await clickSidebarLesson(page, lesson);
-    if (!clicked) {
-      throw new Error('Lesson element not found in sidebar.');
-    }
-
-    // Wait for page to load (video player will auto-load and trigger m3u8 request)
-    await page.waitForTimeout(options.lessonLoadTimeoutMs);
-    
-    // Give extra time for network interceptor to catch m3u8
-    await waitForCaptureWindow(activeCapture);
-    
-    lesson.lessonUrl = page.url();
-
-    if (activeCapture.foundUrls.size > 0) {
-      lesson.status = 'completed';
-      lesson.hasVideo = true;
-      logClean(`  [-] ${lesson.lessonTitle} -> [OK] m3u8 ditangkap (${activeCapture.foundUrls.size} URL)`);
-    } else {
-      lesson.status = 'no_video';
-      lesson.hasVideo = false;
-      logClean(`  [-] ${lesson.lessonTitle} -> Tidak ada video (Text/Quiz)`);
-    }
-    
-  } catch (error) {
-    lesson.error = error.message;
-    lesson.status = 'error';
-    logError(`  [-] ${lesson.lessonTitle} -> [ERROR] ${error.message}`);
-  } finally {
-    activeCapture = null;
+  for (let attempt = 1; attempt <= options.maxAttempts; attempt++) {
+    lesson.status = 'in_progress';
+    lesson.error = null;
+    lesson.attempts = attempt;
     await saveVideosState();
+
+    try {
+      // Set activeCapture BEFORE clicking so network interceptor catches m3u8 during page load
+      activeCapture = {
+        lessonId: lesson.lessonId,
+        videoIndex: 1,
+        startedAt: Date.now(),
+        foundUrls: new Set()
+      };
+
+      // Re-expand sidebar because Huawei collapses other BABs/sub-BABs after each click
+      await expandSidebarItems(page);
+
+      const clicked = await clickSidebarLesson(page, lesson);
+      if (!clicked) {
+        throw new Error('Lesson element not found in sidebar.');
+      }
+
+      // Wait for page to load (video player will auto-load and trigger m3u8 request)
+      await page.waitForTimeout(options.lessonLoadTimeoutMs);
+      
+      // Give extra time for network interceptor to catch m3u8
+      await waitForCaptureWindow(activeCapture);
+      
+      lesson.lessonUrl = page.url();
+
+      if (activeCapture.foundUrls.size > 0) {
+        lesson.status = 'completed';
+        lesson.hasVideo = true;
+        logClean(`  [-] ${lesson.lessonTitle} -> [OK] m3u8 captured (${activeCapture.foundUrls.size} URLs)`);
+      } else {
+        lesson.status = 'no_video';
+        lesson.hasVideo = false;
+        logClean(`  [-] ${lesson.lessonTitle} -> No video (Text/Quiz)`);
+      }
+      
+    } catch (error) {
+      lesson.error = error.message;
+      lesson.status = 'failed';
+      logError(`  [-] ${lesson.lessonTitle} -> [ERROR] ${error.message}`);
+    } finally {
+      activeCapture = null;
+      await saveVideosState();
+    }
+
+    if (lesson.status === 'completed') {
+      break; // Success
+    }
+
+    if (attempt < options.maxAttempts) {
+      logDetail(`[lesson] Retrying ${lesson.lessonTitle} in ${options.retryDelayMs}ms... (Attempt ${attempt + 1}/${options.maxAttempts})`);
+      await page.waitForTimeout(options.retryDelayMs);
+    } else {
+      if (lesson.status === 'no_video') {
+        logClean(`  [-] ${lesson.lessonTitle} -> [FINISH] Still no video (Text/Quiz) after ${options.maxAttempts} attempts.`);
+      } else {
+        logClean(`  [-] ${lesson.lessonTitle} -> [FAIL] Failed to process after ${options.maxAttempts} attempts.`);
+      }
+    }
   }
 }
 

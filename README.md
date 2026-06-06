@@ -1,20 +1,20 @@
 # Huawei HLS Capture PoC
 
-Proof-of-concept Node.js tool untuk mengamati traffic browser yang sah dari akun Huawei Talent Online Learning yang sudah login manual, lalu menyimpan kandidat URL video HLS.
+Proof-of-concept Node.js tool to monitor legitimate browser traffic from a manually logged-in Huawei Talent Online Learning account, and save candidate HLS video URLs.
 
-Tool ini tidak melakukan bypass autentikasi, tidak membaca cookie Chrome langsung, tidak reverse engineering API private, tidak mengunduh video, tidak memodifikasi request, dan tidak menangani DRM.
+This tool does not perform authentication bypass, read Chrome cookies directly, reverse engineer private APIs, download videos, modify requests, or handle DRM.
 
-## Alasan Desain
+## Design Rationale
 
-1. `launchPersistentContext` dipakai agar Chromium Playwright memiliki profile persisten. Setelah login manual sekali, session dapat dipakai ulang dari folder `playwright-profile/`.
-2. Profile Playwright dibuat terpisah dari Chrome utama supaya tidak perlu membaca cookie browser personal dan lebih aman untuk eksperimen.
-3. Network dipantau memakai event resmi Playwright `request` dan `response`. Script hanya mengamati traffic browser yang terjadi dari halaman yang dibuka.
-4. Kandidat HLS dideteksi dari URL yang mengandung `.m3u8` atau response `content-type` HLS: `application/vnd.apple.mpegurl` dan `application/x-mpegURL`.
-5. Deduplikasi memakai `Set` di memory dan isi lama `urls.txt` dibaca saat startup, sehingga restart script tidak menulis URL yang sama lagi.
-6. `urls.txt` hanya berisi URL unik agar mudah diproses berikutnya. `urls.log` menyimpan timestamp dan metadata singkat untuk audit.
-7. Mode debug dibuat opsional karena halaman modern dapat menghasilkan sangat banyak request dan response.
+1. `launchPersistentContext` is used so that Chromium Playwright has a persistent profile. After logging in manually once, the session can be reused from the `playwright-profile/` folder.
+2. A separate Playwright profile is created from the main Chrome to avoid reading personal browser cookies and to be safer for experimentation.
+3. Network monitoring uses official Playwright events: `request` and `response`. The script only observes the browser traffic originating from the opened page.
+4. HLS candidates are detected from URLs containing `.m3u8` or response `content-type` for HLS: `application/vnd.apple.mpegurl` and `application/x-mpegURL`.
+5. Deduplication uses an in-memory `Set`. The existing content of `urls.log` is read at startup, preventing the script from rewriting the same URLs upon restart.
+6. `urls.log` stores timestamps, short metadata, and unique HLS URLs.
+7. Debug mode is optional because modern pages can generate a vast amount of requests and responses.
 
-## Struktur Project
+## Project Structure
 
 ```text
 huawei-hls-capture/
@@ -25,23 +25,22 @@ huawei-hls-capture/
     index.js
 ```
 
-File runtime yang akan muncul:
+Generated runtime files:
 
 ```text
-playwright-profile/  # profile Chromium persisten
-urls.txt             # URL HLS unik
-urls.log             # log timestamp tiap URL baru
-videos.json          # metadata lesson dan URL HLS per lesson
+playwright-profile/  # persistent Chromium profile
+urls.log             # log of timestamps for each new URL and metadata
+videos.json          # module/lesson metadata and crawl results
 ```
 
-## Kebutuhan
+## Requirements
 
 1. Windows 11
-2. Node.js 18 atau lebih baru
+2. Node.js 18 or newer
 3. Internet access
-4. Akun Huawei Talent Online Learning yang login manual melalui browser Playwright
+4. Huawei Talent Online Learning account to log in manually via the Playwright browser
 
-## Instalasi
+## Installation
 
 ```powershell
 cd C:\Users\adima\OneDrive\Dokumen\Github\huawei-hls-capture
@@ -49,180 +48,198 @@ npm install
 npx playwright install chromium
 ```
 
-## Cara Menjalankan
+## How to Run
 
-Jalankan dengan URL course Huawei:
-
-```powershell
-npm start -- --url "https://contoh-url-course-huawei"
-```
-
-Alur default manual:
-
-1. Jalankan `npm start`.
-2. Browser Chromium Playwright terbuka.
-3. Jika belum login, login manual dulu di browser itu.
-4. Jika sudah login, pastikan halaman course terbuka dan siap.
-5. Tekan Enter di CMD saat prompt muncul.
-6. Klik lesson/video manual satu per satu di browser.
-7. Setiap `.m3u8` yang terlihat dari network browser akan masuk ke `urls.txt` dan `urls.log`.
-
-Script akan terus memonitor network sampai dihentikan dengan `Ctrl+C`.
-
-Jika tidak mau menunggu prompt Enter dan ingin monitoring langsung aktif:
+Run with the Huawei course URL:
 
 ```powershell
-npm start -- --url "https://contoh-url-course-huawei" --no-wait
+npm start -- --url "https://example-huawei-course-url"
 ```
 
-## Mode Auto Lesson
+Default manual workflow:
 
-Mode ini mencoba meng-enumerasi lesson dari UI course, klik lesson satu per satu, menunggu player memuat video, lalu menyimpan `.m3u8` yang terlihat dari traffic browser normal.
+1. Run `npm start`.
+2. The Playwright Chromium browser will open.
+3. If not logged in, log in manually first in that browser window.
+4. Once logged in, ensure the course page is open and ready.
+5. Press Enter in the CMD when prompted.
+6. Click lessons/videos manually one by one in the browser.
+7. Every `.m3u8` observed from the browser's network will be logged to `urls.log`.
+
+The script will continue monitoring the network until stopped with `Ctrl+C`.
+
+If you do not want to wait for the Enter prompt and prefer monitoring to be active immediately:
 
 ```powershell
-npm start -- --url "https://contoh-url-course-huawei" --auto-lessons
+npm start -- --url "https://example-huawei-course-url" --no-wait
 ```
 
-Dengan debug:
+## Auto Lesson Mode
+
+This mode attempts to enumerate lessons from the course UI, click them one by one, wait for the player to load the video, and save the `.m3u8` observed from normal browser traffic.
 
 ```powershell
-npm run start:debug -- --url "https://contoh-url-course-huawei" --auto-lessons
+npm start -- --url "https://example-huawei-course-url" --auto-lessons
 ```
 
-Strategi mode auto:
-
-1. Membuka halaman course dengan persistent profile yang sama.
-2. Expand elemen visible dengan `aria-expanded="false"` untuk membuka module/section.
-3. Scroll halaman dan container umum untuk memicu lazy loading.
-4. Mengambil kandidat lesson dari elemen clickable yang visible seperti `a`, `button`, role `button`, role `treeitem`, role `listitem`, dan elemen bertabindex.
-5. Klik kandidat lesson melalui UI normal, bukan memanggil endpoint internal.
-6. Menunggu player/request video muncul dalam capture window.
-7. Retry lesson jika `.m3u8` belum ditemukan.
-8. Menulis progress setelah setiap lesson supaya bisa resume.
-
-Resume aktif secara default. Jika proses berhenti, jalankan command yang sama dan lesson dengan status `completed` akan dilewati.
-
-Untuk memulai ulang metadata dari awal:
+With debug mode:
 
 ```powershell
-npm start -- --url "https://contoh-url-course-huawei" --auto-lessons --no-resume
+npm run start:debug -- --url "https://example-huawei-course-url" --auto-lessons
 ```
 
-Tuning umum:
+Auto mode strategy:
+
+1. Open the course page using the same persistent profile.
+2. Expand visible elements with `aria-expanded="false"` to open modules/sections.
+3. Scroll the page and general containers to trigger lazy loading.
+4. Fetch lesson candidates from visible clickable elements like `a`, `button`, role `button`, role `treeitem`, role `listitem`, and elements with tabindex.
+5. Click lesson candidates through the normal UI, instead of calling internal endpoints.
+6. Wait for the player/video request to appear within the capture window.
+7. Retry the lesson if no `.m3u8` is found.
+8. Write progress after every lesson to enable resuming.
+
+Resume is enabled by default. If the process stops, run the same command and lessons with the status `completed` will be skipped.
+
+To rebuild metadata from scratch:
 
 ```powershell
-npm start -- --url "https://contoh-url-course-huawei" --auto-lessons --max-attempts 3 --capture-window-ms 30000 --lesson-load-timeout-ms 8000
+npm start -- --url "https://example-huawei-course-url" --auto-lessons --no-resume
 ```
 
-## Mode Debug
+General tuning:
 
 ```powershell
-npm run start:debug -- --url "https://contoh-url-course-huawei"
+npm start -- --url "https://example-huawei-course-url" --auto-lessons --max-attempts 3 --capture-window-ms 30000 --lesson-load-timeout-ms 8000
 ```
 
-Mode debug menampilkan:
+## Crawl Learning Page Mode
+
+The newest and highly recommended mode. This mode assumes you are already on the Learning page with the sidebar menu on the left. The script will automatically detect modules and sub-modules, expand the menu, and capture HLS URLs from each material sequentially.
+
+```powershell
+npm run crawl -- --url "https://example-huawei-course-url"
+```
+
+This is equivalent to using the flag:
+```powershell
+npm start -- --crawl-learning-page --url "https://example-huawei-course-url"
+```
+
+## Debug Mode
+
+```powershell
+npm run start:debug -- --url "https://example-huawei-course-url"
+```
+
+Debug mode displays:
 
 1. request URL
 2. response URL
 3. response status
 4. response `content-type`
 
-Alternatif via environment variable:
+Alternative via environment variable:
 
 ```powershell
 $env:DEBUG_HLS_CAPTURE="1"
-npm start -- --url "https://contoh-url-course-huawei"
+npm start -- --url "https://example-huawei-course-url"
 ```
 
-## Opsi CLI
+## CLI Options
 
 ```text
 --url <url>             Huawei course page to open
 --debug                 Print request URL, response URL, status, and content-type
---auto-lessons          Discover and click lesson candidates automatically
+--crawl-learning-page   Parse sidebar menu hierarchically and crawl lessons automatically
+--auto-lessons          Discover and click lesson candidates automatically (Legacy)
 --no-wait               Do not wait for Enter before manual monitoring
 --resume                Resume from videos.json, default: enabled
 --no-resume             Ignore existing videos.json and rebuild state
+--retry-no-video        Retry lessons marked as no_video on resume
 --max-attempts <n>      Retry attempts per lesson, default: 3
 --capture-window-ms <n> Wait time for HLS after clicking lesson, default: 20000
---lesson-load-timeout-ms <n> Wait after clicking lesson before play/capture, default: 5000
+--after-first-hit-grace-ms <n> Extra wait time after first m3u8 is found, default: 5000
+--lesson-load-timeout-ms <n> Wait after clicking lesson before capture, default: 5000
 --profile-dir <path>    Persistent browser profile directory, default: playwright-profile
+--videos-file <path>    Custom output path for videos metadata, default: videos.json
+--log-file <path>       Custom output path for URL logs, default: urls.log
 --channel <name>        Optional browser channel, for example: chrome or msedge
 ```
 
-Contoh memakai Microsoft Edge channel jika tersedia:
+Example using the Microsoft Edge channel if available:
 
 ```powershell
-npm start -- --channel msedge --url "https://contoh-url-course-huawei"
+npm start -- --channel msedge --url "https://example-huawei-course-url"
 ```
 
 ## Output
 
-Saat URL baru ditemukan, console menampilkan:
+When a new URL is found, the console displays:
 
 ```text
 [hls] 2026-06-04T14:00:00.000Z https://example/video/master.m3u8
 ```
 
-`urls.txt`:
-
-```text
-https://example/video/master.m3u8
-```
-
-`urls.log`:
-
-```text
-[2026-06-04T14:00:00.000Z] source=response status=200 content-type=application/vnd.apple.mpegurl https://example/video/master.m3u8
-```
-
-`videos.json`:
+`videos.json` (for `--crawl-learning-page` format):
 
 ```json
 {
   "courseUrl": "https://e.huawei.com/...",
-  "createdAt": "2026-06-04T14:00:00.000Z",
-  "updatedAt": "2026-06-04T14:10:00.000Z",
-  "lessons": [
+  "createdAt": "2026-06-06T10:00:00.000Z",
+  "updatedAt": "2026-06-06T10:15:00.000Z",
+  "modules": [
     {
-      "id": "lesson-123456",
-      "title": "Lesson Title",
-      "lessonUrl": "https://e.huawei.com/...",
-      "status": "completed",
-      "attempts": 1,
-      "m3u8Urls": [
-        "https://example/video/master.m3u8"
-      ],
-      "firstFoundAt": "2026-06-04T14:02:00.000Z",
-      "lastFoundAt": "2026-06-04T14:02:00.000Z",
-      "lastTriedAt": "2026-06-04T14:01:45.000Z",
-      "completedAt": "2026-06-04T14:02:03.000Z",
-      "error": null
+      "moduleIndex": "1",
+      "moduleTitle": "1. WLAN Technical Basics",
+      "lessons": [
+        {
+          "lessonId": "lesson-123456",
+          "lessonIndex": "1.1",
+          "lessonTitle": "1.1 Enterprise WLAN Overview",
+          "textToMatch": "1.1 Enterprise WLAN Overview",
+          "selector": "span.text",
+          "status": "completed",
+          "hasVideo": true,
+          "lessonUrl": "https://e.huawei.com/...",
+          "attempts": 1,
+          "videos": [
+            {
+              "videoIndex": 1,
+              "m3u8Url": "https://example/video/master.m3u8",
+              "timestamp": "2026-06-06T10:05:00.000Z",
+              "source": "response",
+              "status": 200,
+              "contentType": "application/vnd.apple.mpegurl"
+            }
+          ]
+        }
+      ]
     }
   ]
 }
 ```
 
-## Catatan Operasional
+## Operational Notes
 
-1. Jika tidak ada `.m3u8` muncul, kemungkinan video belum dimainkan atau player belum memuat playlist HLS.
-2. Mode auto lesson memakai selector heuristik karena UI Huawei bisa berubah. Jika discovery tidak lengkap, expand module/section manual lalu rerun.
-3. URL HLS kadang bersifat sementara atau terikat session akun.
-4. Jika platform memakai DRM atau token ketat, tool ini tetap hanya mencatat URL yang terlihat dari browser.
-5. Tool tidak melakukan reverse engineering API private dan tidak mengakses endpoint yang tidak dipakai browser normal.
+1. If no `.m3u8` appears, it's possible the video hasn't played or the player hasn't loaded the HLS playlist.
+2. Auto lesson mode uses heuristic selectors because Huawei's UI may change. If discovery is incomplete, expand modules/sections manually and rerun.
+3. HLS URLs are sometimes temporary or tied to the account session.
+4. If the platform uses DRM or strict tokens, this tool still only logs the URLs visible to the normal browser.
+5. The tool does not perform private API reverse engineering and does not access endpoints unused by the normal browser.
 
 ## Troubleshooting
 
-Jika browser tidak terbuka:
+If the browser fails to open:
 
 ```powershell
 npx playwright install chromium
 ```
 
-Jika navigation timeout muncul, browser tetap dibiarkan terbuka. Login manual atau reload halaman dari browser.
+If a navigation timeout occurs, the browser is left open. Log in manually or reload the page from the browser.
 
-Jika output debug terlalu ramai, gunakan mode normal:
+If debug output is too noisy, use normal mode:
 
 ```powershell
-npm start -- --url "https://contoh-url-course-huawei"
+npm start -- --url "https://example-huawei-course-url"
 ```
