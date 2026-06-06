@@ -4,6 +4,10 @@ import path from 'node:path';
 import process from 'node:process';
 import readline from 'node:readline/promises';
 
+function toWIB(date) {
+  return (date || new Date()).toLocaleString('sv-SE', { timeZone: 'Asia/Jakarta' }).replace(' ', 'T') + '+07:00';
+}
+
 const DEFAULT_COURSE_URL = 'https://e.huawei.com/en/talent/outPage/#/sxz-course/home?courseId=Q96qaZ1Dx6hJx-3t_2bThTJY5ls&operate=1';
 const HLS_CONTENT_TYPES = [
   'application/vnd.apple.mpegurl',
@@ -13,25 +17,24 @@ const HLS_CONTENT_TYPES = [
 const options = parseArgs(process.argv.slice(2));
 const baseDir = process.cwd();
 const profileDir = path.resolve(baseDir, options.profileDir);
-const urlsFile = path.resolve(baseDir, options.urlsFile);
 const logFile = path.resolve(baseDir, options.logFile);
 const videosFile = path.resolve(baseDir, options.videosFile);
 const detailLogFile = path.resolve(baseDir, options.detailLogFile || 'crawl.log');
 
 async function logDetail(msg) {
-  const ts = new Date().toISOString();
+  const ts = toWIB();
   await appendFile(detailLogFile, `[${ts}] [DETAIL] ${msg}\n`, 'utf8').catch(() => {});
   if (options.debug) console.log(`[${ts}] [DETAIL] ${msg}`);
 }
 
 async function logClean(msg) {
-  const ts = new Date().toISOString();
+  const ts = toWIB();
   console.log(msg);
   await appendFile(detailLogFile, `[${ts}] [CLEAN] ${msg}\n`, 'utf8').catch(() => {});
 }
 
 async function logError(msg) {
-  const ts = new Date().toISOString();
+  const ts = toWIB();
   console.error(msg);
   await appendFile(detailLogFile, `[${ts}] [ERROR] ${msg}\n`, 'utf8').catch(() => {});
 }
@@ -40,29 +43,29 @@ const foundUrls = new Set();
 let activeCapture = null;
 let videosState = null;
 
-await main().catch((error) => {
+main().catch((error) => {
   console.error(`[fatal] ${error.message}`);
   if (options.debug && error.stack) {
     console.error(error.stack);
   }
   process.exitCode = 1;
+}).finally(() => {
+  setTimeout(() => process.exit(process.exitCode || 0), 500);
 });
 
 async function main() {
   await mkdir(profileDir, { recursive: true });
-  await mkdir(path.dirname(urlsFile), { recursive: true });
   await mkdir(path.dirname(logFile), { recursive: true });
   await mkdir(path.dirname(videosFile), { recursive: true });
 
-  for (const url of await loadExistingUrls(urlsFile)) {
+  for (const url of await loadExistingUrls(logFile)) {
     foundUrls.add(url);
   }
 
   logClean('[start] Huawei HLS capture PoC');
   logDetail(`[info] Course URL: ${options.courseUrl}`);
   logDetail(`[info] Persistent profile: ${profileDir}`);
-  logDetail(`[info] URL output: ${urlsFile}`);
-  logDetail(`[info] Timestamp log: ${logFile}`);
+  logDetail(`[info] URL log: ${logFile}`);
   logDetail(`[info] Videos metadata: ${videosFile}`);
   logDetail(`[info] Debug mode: ${options.debug ? 'on' : 'off'}`);
   logDetail(`[info] Auto lessons: ${options.autoLessons ? 'on' : 'off'}`);
@@ -167,7 +170,7 @@ async function collectIfHlsCandidate(candidate) {
   }
 
   const normalizedUrl = normalizeUrl(candidate.url);
-  const timestamp = new Date().toISOString();
+  const timestamp = toWIB();
   if (foundUrls.has(normalizedUrl)) {
     await attachUrlToActiveLesson({ url: normalizedUrl, timestamp, source: candidate.source, status: candidate.status, contentType: candidate.contentType });
     return;
@@ -181,7 +184,6 @@ async function collectIfHlsCandidate(candidate) {
   ].filter(Boolean).join(' ');
 
   try {
-    await appendFile(urlsFile, `${normalizedUrl}\n`, 'utf8');
     await appendFile(logFile, `[${timestamp}] ${metadata} ${normalizedUrl}\n`, 'utf8');
     await attachUrlToActiveLesson({ url: normalizedUrl, timestamp, source: candidate.source, status: candidate.status, contentType: candidate.contentType });
     console.log(`[hls] ${timestamp} ${normalizedUrl}`);
@@ -269,13 +271,13 @@ async function processLessons(page) {
 async function processLesson(page, lesson) {
   console.log(`[lesson] ${lesson.title}`);
   lesson.status = 'in_progress';
-  lesson.lastTriedAt = new Date().toISOString();
+  lesson.lastTriedAt = toWIB();
   lesson.error = null;
   await saveVideosState();
 
   for (let attempt = 1; attempt <= options.maxAttempts; attempt += 1) {
     lesson.attempts = (lesson.attempts ?? 0) + 1;
-    lesson.lastTriedAt = new Date().toISOString();
+    lesson.lastTriedAt = toWIB();
     await saveVideosState();
 
     console.log(`[lesson] Attempt ${attempt}/${options.maxAttempts}: ${lesson.title}`);
@@ -298,7 +300,7 @@ async function processLesson(page, lesson) {
       if (lesson.m3u8Urls.length > 0) {
         lesson.status = 'completed';
         lesson.lessonUrl = page.url();
-        lesson.completedAt = new Date().toISOString();
+        lesson.completedAt = toWIB();
         lesson.error = null;
         await saveVideosState();
         console.log(`[lesson] Completed with ${lesson.m3u8Urls.length} HLS URL(s): ${lesson.title}`);
@@ -321,7 +323,7 @@ async function processLesson(page, lesson) {
 
   lesson.status = lesson.m3u8Urls.length > 0 ? 'completed' : 'no_video_found';
   lesson.lessonUrl = page.url();
-  lesson.completedAt = lesson.status === 'completed' ? new Date().toISOString() : null;
+  lesson.completedAt = lesson.status === 'completed' ? toWIB() : null;
   await saveVideosState();
   console.log(`[lesson] ${lesson.status}: ${lesson.title}`);
 }
@@ -573,8 +575,8 @@ async function loadVideosState() {
 function createEmptyVideosState() {
   const state = {
     courseUrl: options.courseUrl,
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString()
+    createdAt: toWIB(),
+    updatedAt: toWIB()
   };
   if (options.crawlLearningPage) {
     state.modules = [];
@@ -586,7 +588,7 @@ function createEmptyVideosState() {
 
 async function saveVideosState() {
   if (!videosState) return;
-  videosState.updatedAt = new Date().toISOString();
+  videosState.updatedAt = toWIB();
   await writeFile(videosFile, `${JSON.stringify(videosState, null, 2)}\n`, 'utf8');
 }
 
@@ -609,7 +611,15 @@ function escapeForSelectorText(value) {
 async function loadExistingUrls(filePath) {
   try {
     const content = await readFile(filePath, 'utf8');
-    return content.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    return content.split(/\r?\n/)
+      .map(line => line.trim())
+      .filter(l => l && !l.startsWith('====='))
+      .map(line => {
+        // urls.log format: [timestamp] metadata URL
+        const match = line.match(/https?:\/\/\S+/);
+        return match ? match[0] : line;
+      })
+      .filter(Boolean);
   } catch (error) {
     if (error.code === 'ENOENT') {
       return [];
@@ -623,7 +633,6 @@ function parseArgs(args) {
     courseUrl: process.env.COURSE_URL || DEFAULT_COURSE_URL,
     debug: process.env.DEBUG_HLS_CAPTURE === '1' || process.env.DEBUG_HLS_CAPTURE === 'true',
     profileDir: process.env.PROFILE_DIR || 'playwright-profile',
-    urlsFile: process.env.URLS_FILE || 'urls.txt',
     logFile: process.env.LOG_FILE || 'urls.log',
     videosFile: process.env.VIDEOS_FILE || 'videos.json',
     autoLessons: process.env.AUTO_LESSONS === '1' || process.env.AUTO_LESSONS === 'true',
@@ -744,6 +753,7 @@ Environment:
 
 async function crawlLearningPageFlow(page) {
   logClean('\n============================= START CRAWL SESSION =============================');
+  await appendFile(logFile, `\n===== START SESSION [${toWIB()}] =====\n`, 'utf8').catch(() => {});
   videosState = await loadVideosState();
   logDetail('[crawl] Waiting for course UI to settle...');
   await page.waitForLoadState('domcontentloaded').catch(() => {});
@@ -773,6 +783,7 @@ async function crawlLearningPageFlow(page) {
   }
 
   await processHierarchicalLessons(page);
+  await appendFile(logFile, `===== END SESSION [${toWIB()}] =====\n`, 'utf8').catch(() => {});
   logClean('\n============================== END CRAWL SESSION ==============================\n');
 }
 
@@ -820,7 +831,10 @@ async function expandSidebarItems(page) {
       
       for (const node of nodes) {
         if (window._clickedExpanders.has(node)) continue;
-        if (node.closest('.is-expanded, .expanded, [aria-expanded="true"]')) continue;
+        
+        const treeNode = node.closest('.tree-node, [role="treeitem"], li');
+        if (treeNode && (treeNode.classList.contains('is-expanded') || treeNode.classList.contains('expanded') || treeNode.getAttribute('aria-expanded') === 'true')) continue;
+        
         if (node.closest('header, .header, .nav-bar, .top-bar, .global-nav')) continue;
         
         const rect = node.getBoundingClientRect();
@@ -904,15 +918,16 @@ async function buildSidebarHierarchy(page) {
        if (!text || text.length < 3 || text.length > 80) continue; 
        if (blocklist.includes(text)) continue;
 
-       const isLevel1 = /^\d+\.?\s+[a-zA-Z]/i.test(text) || /^Course Introduction/i.test(text) || /^Final Exam/i.test(text);
-       const isLevel2 = /^\d+\.\d+\s+/i.test(text) || /^Introduction to/i.test(text);
+       const isLevel1 = /^\d+\.?\s+[a-zA-Z]/i.test(text) || /^Course Introduction/i.test(text) || /^Final Exam/i.test(text) || /^Training Materials/i.test(text) || /^Quiz$/i.test(text);
+       const isLevel2 = /^\d+\.\d+\s+/i.test(text) || /^Introduction to/i.test(text) || /^HCIA-/i.test(text);
        
-       // Level 3 items usually don't have the number prefix, or they are identical to Level 2 text but deeply nested, or they have specific icons (play/doc)
-       const hasPlayIcon = node.querySelector('i[class*="play"], i[class*="video"], svg path[d*="M8 5v14l11-7z"]') !== null;
-       const hasDocIcon = node.querySelector('i[class*="document"], i[class*="file"], i[class*="text"]') !== null;
+       const contentWrapper = node.querySelector(':scope > .tree-node-content, :scope > .el-submenu__title') || node;
+       const htmlContent = contentWrapper.innerHTML.toLowerCase();
+       const hasPlayIcon = contentWrapper.querySelector('i[class*="play"], i[class*="video"], svg path[d*="M8 5v14l11-7z"]') !== null || htmlContent.includes('#icon-catalog-video') || htmlContent.includes('video');
+       const hasDocIcon = contentWrapper.querySelector('i[class*="document"], i[class*="file"], i[class*="text"]') !== null || htmlContent.includes('#icon-catalog-document') || htmlContent.includes('document');
        
        // Detect if it's a leaf node. If it has no submenu/children, it's a leaf.
-       const hasChildren = node.querySelector('ul, .el-menu, [role="group"]') !== null || node.getAttribute('aria-expanded') !== null;
+       const hasChildren = node.querySelector(':scope > ul, :scope > .el-menu, :scope > [role="group"], :scope > .tree-node-children') !== null || node.getAttribute('aria-expanded') !== null;
        const isLeaf = !hasChildren || hasPlayIcon || hasDocIcon;
 
        if (isLevel1 && !isLeaf) {
@@ -1026,64 +1041,44 @@ async function processHierarchicalLessons(page) {
 }
 
 async function processHierarchicalLesson(page, lesson) {
-  logDetail(`[lesson] ${lesson.lessonTitle} - Starting`);
   lesson.status = 'in_progress';
   lesson.error = null;
   lesson.attempts = (lesson.attempts || 0) + 1;
   await saveVideosState();
 
   try {
+    // Set activeCapture BEFORE clicking so network interceptor catches m3u8 during page load
+    activeCapture = {
+      lessonId: lesson.lessonId,
+      videoIndex: 1,
+      startedAt: Date.now(),
+      foundUrls: new Set()
+    };
+
+    // Re-expand sidebar because Huawei collapses other BABs/sub-BABs after each click
+    await expandSidebarItems(page);
+
     const clicked = await clickSidebarLesson(page, lesson);
     if (!clicked) {
       throw new Error('Lesson element not found in sidebar.');
     }
 
+    // Wait for page to load (video player will auto-load and trigger m3u8 request)
     await page.waitForTimeout(options.lessonLoadTimeoutMs);
     
-    lesson.lessonUrl = page.url();
-    const videoCount = await countVideosInMainArea(page);
+    // Give extra time for network interceptor to catch m3u8
+    await waitForCaptureWindow(activeCapture);
     
-    if (videoCount === 0) {
+    lesson.lessonUrl = page.url();
+
+    if (activeCapture.foundUrls.size > 0) {
+      lesson.status = 'completed';
+      lesson.hasVideo = true;
+      logClean(`  [-] ${lesson.lessonTitle} -> [OK] m3u8 ditangkap (${activeCapture.foundUrls.size} URL)`);
+    } else {
       lesson.status = 'no_video';
       lesson.hasVideo = false;
-      logClean(`  [-] ${lesson.lessonTitle} -> Tidak ada video (Text only)`);
-      logDetail(`[lesson] no_video: ${lesson.lessonTitle}`);
-    } else {
-      logClean(`  [-] ${lesson.lessonTitle} -> Ditemukan ${videoCount} video(s)`);
-      logDetail(`[lesson] Found ${videoCount} video(s) for ${lesson.lessonTitle}`);
-      for (let vIdx = 1; vIdx <= videoCount; vIdx++) {
-        logClean(`      -> Memproses Video ${vIdx}...`);
-        logDetail(`[video] Processing video ${vIdx}/${videoCount}`);
-        
-        activeCapture = {
-          lessonId: lesson.lessonId,
-          videoIndex: vIdx,
-          startedAt: Date.now(),
-          foundUrls: new Set()
-        };
-
-        const played = await playVideoInMainArea(page, vIdx);
-        if (played) {
-          await waitForCaptureWindow(activeCapture);
-          if (activeCapture.foundUrls.size > 0) {
-             logClean(`      -> [OK] Berhasil mendapatkan .m3u8`);
-          } else {
-             logClean(`      -> [FAIL] Timeout menunggu .m3u8`);
-          }
-        } else {
-          logError(`      -> [FAIL] Tidak bisa melakukan play Video ${vIdx}`);
-        }
-        
-        activeCapture = null;
-        await page.waitForTimeout(2000);
-      }
-      
-      if (lesson.videos && lesson.videos.length > 0) {
-         lesson.status = 'completed';
-      } else {
-         lesson.status = 'error';
-         lesson.error = 'Videos detected but no HLS stream captured.';
-      }
+      logClean(`  [-] ${lesson.lessonTitle} -> Tidak ada video (Text/Quiz)`);
     }
     
   } catch (error) {
@@ -1097,36 +1092,53 @@ async function processHierarchicalLesson(page, lesson) {
 }
 
 async function clickSidebarLesson(page, lesson) {
-  // First try the strict selector
+  let targetFrame = page.mainFrame();
+  for (const frame of page.frames()) {
+    try {
+      if (await frame.locator('text=/Menu/i').count() > 0) {
+        targetFrame = frame;
+        break;
+      }
+    } catch(e) {}
+  }
+
+  // First try the strict selector, filtering for visible
   try {
-    const loc = page.locator(`aside ${lesson.selector}, .sidebar ${lesson.selector}`).first();
-    if (await loc.count() > 0 && await loc.isVisible()) {
+    const loc = targetFrame.locator(lesson.selector).locator('visible=true').first();
+    if (await loc.count() > 0) {
       await loc.scrollIntoViewIfNeeded();
       await loc.click({ timeout: 5000 });
       return true;
     }
   } catch (e) {}
 
-  // Fallback: match text exactly within sidebar
+  // Fallback: match text exactly within sidebar, ONLY visible elements
   const safeText = escapeForSelectorText(lesson.textToMatch);
-  const selectors = [
-    `aside *:text-is("${safeText}")`,
-    `.sidebar *:text-is("${safeText}")`,
-    `.menu *:text-is("${safeText}")`,
-    `aside *:has-text("${safeText}")`,
-    `.sidebar *:has-text("${safeText}")`
-  ];
+  
+  try {
+    // 1. Try exact text match in frame
+    const exactLocs = targetFrame.getByText(lesson.textToMatch, { exact: true }).locator('visible=true');
+    const exactCount = await exactLocs.count();
+    if (exactCount > 0) {
+      const target = exactLocs.nth(exactCount - 1); // Get the last one
+      await target.scrollIntoViewIfNeeded();
+      await target.click({ timeout: 5000 });
+      return true;
+    }
+  } catch (e) {}
 
-  for (const sel of selectors) {
-    try {
-      const loc = page.locator(sel).last(); // usually innermost element
-      if (await loc.count() > 0 && await loc.isVisible()) {
-        await loc.scrollIntoViewIfNeeded();
-        await loc.click({ timeout: 5000 });
-        return true;
-      }
-    } catch (e) {}
-  }
+  try {
+    // 2. Try partial text match in frame
+    const partialLocs = targetFrame.getByText(lesson.textToMatch).locator('visible=true');
+    const partialCount = await partialLocs.count();
+    if (partialCount > 0) {
+      const target = partialLocs.nth(partialCount - 1); // Get the last one
+      await target.scrollIntoViewIfNeeded();
+      await target.click({ timeout: 5000 });
+      return true;
+    }
+  } catch (e) {}
+
   return false;
 }
 

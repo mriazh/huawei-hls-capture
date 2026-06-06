@@ -5,4 +5,11 @@ urls.log
 *.tmp
 videos.json
 process.log
+crawl.log
 .env
+inspect_dom.js
+inspect_dump.html
+inspect_result.json
+dump.js
+test_logic.js
+verify_dump.js
