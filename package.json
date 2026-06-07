@@ -7,7 +7,9 @@
   "scripts": {
     "start": "node src/index.js",
     "start:debug": "node src/index.js --debug",
-    "crawl": "node src/index.js --crawl-learning-page"
+    "crawl": "node src/index.js --crawl-learning-page",
+    "convert": "node src/index.js --convert",
+    "scrape-and-convert": "node src/index.js --crawl-learning-page --ask-convert"
   },
   "dependencies": {
     "playwright": "^1.49.1"

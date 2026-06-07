@@ -13,3 +13,5 @@ inspect_result.json
 dump.js
 test_logic.js
 verify_dump.js
+downloads/
+scratch/

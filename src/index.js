@@ -1,8 +1,10 @@
 import { chromium } from 'playwright';
-import { appendFile, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, readFile, writeFile, stat } from 'node:fs/promises';
+import { writeFileSync } from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
 import readline from 'node:readline/promises';
+import { spawn } from 'node:child_process';
 
 function toWIB(date) {
   return (date || new Date()).toLocaleString('sv-SE', { timeZone: 'Asia/Jakarta' }).replace(' ', 'T') + '+07:00';
@@ -43,6 +45,15 @@ const foundUrls = new Set();
 let activeCapture = null;
 let videosState = null;
 
+process.on('exit', () => {
+  if (videosState) {
+    try {
+      videosState.updatedAt = toWIB();
+      writeFileSync(videosFile, `${JSON.stringify(videosState, null, 2)}\n`, 'utf8');
+    } catch (e) {}
+  }
+});
+
 main().catch((error) => {
   console.error(`[fatal] ${error.message}`);
   if (options.debug && error.stack) {
@@ -62,6 +73,29 @@ async function main() {
     foundUrls.add(url);
   }
 
+  const isExplicitConvert = options.convert;
+  const isExplicitCrawl = options.crawlLearningPage || options.autoLessons || process.argv.slice(2).some(arg => arg.startsWith('--url'));
+
+  if (isExplicitConvert) {
+    await convertVideosFromState({ returnToMenu: false });
+    return;
+  }
+
+  if (isExplicitCrawl) {
+    await runCrawlWorkflow();
+    if (options.autoConvert) {
+      await convertVideosFromState({ returnToMenu: false });
+    } else if (options.askConvert) {
+      await promptConversionAfterCrawl({ returnToMenu: false });
+    }
+    return;
+  }
+
+  // No explicit mode flags -> interactive menu
+  await showMainMenu();
+}
+
+async function runCrawlWorkflow() {
   logClean('[start] Huawei HLS capture PoC');
   logDetail(`[info] Course URL: ${options.courseUrl}`);
   logDetail(`[info] Persistent profile: ${profileDir}`);
@@ -144,15 +178,21 @@ async function main() {
 
   if (options.crawlLearningPage) {
     await crawlLearningPageFlow(page);
-    console.log('[done] Crawling learning page finished. Browser remains open for inspection. Press Ctrl+C to stop.');
+    console.log('[done] Crawling learning page finished.');
   } else if (options.autoLessons) {
     await processLessons(page);
-    console.log('[done] Auto lesson processing finished. Browser remains open for inspection. Press Ctrl+C to stop.');
+    console.log('[done] Auto lesson processing finished.');
   } else {
     console.log('[ready] Monitoring active. Click lesson/video manually in the browser. Press Ctrl+C to stop.');
+    await new Promise(() => {}); // hang forever if manual
   }
 
-  await new Promise(() => {});
+  if (!options.askConvert) {
+     console.log('[info] Browser remains open for inspection. Press Ctrl+C to stop.');
+     await new Promise(() => {});
+  } else {
+     await context.close().catch(() => {});
+  }
 }
 
 async function waitForEnter() {
@@ -548,21 +588,28 @@ async function loadVideosState() {
   try {
     const parsed = JSON.parse(await readFile(videosFile, 'utf8'));
     parsed.courseUrl = options.courseUrl;
-    if (options.crawlLearningPage) {
-      parsed.modules ??= [];
+    if (parsed.modules) {
       for (const mod of parsed.modules) {
         mod.lessons ??= [];
         for (const lesson of mod.lessons) {
-          if (lesson.status === 'error') lesson.status = 'failed';
+          if (lesson.status === 'error' || lesson.status === 'in_progress') lesson.status = 'failed';
           lesson.videos ??= [];
           for (const video of lesson.videos) {
             foundUrls.add(video.m3u8Url);
+            if (video.download && video.download.status === 'in_progress') {
+              video.download.status = 'failed';
+              video.download.error = 'Process crashed/exited during download';
+            }
           }
         }
       }
-    } else {
-      parsed.lessons ??= [];
+    } else if (parsed.lessons) {
       for (const lesson of parsed.lessons) {
+        if (lesson.status === 'error' || lesson.status === 'in_progress') lesson.status = 'failed';
+        if (lesson.download && lesson.download.status === 'in_progress') {
+          lesson.download.status = 'failed';
+          lesson.download.error = 'Process crashed/exited during download';
+        }
         lesson.m3u8Urls ??= [];
         for (const url of lesson.m3u8Urls) {
           foundUrls.add(url);
@@ -655,7 +702,18 @@ function parseArgs(args) {
     retryDelayMs: Number(process.env.RETRY_DELAY_MS || 1500),
     discoveryScrolls: Number(process.env.DISCOVERY_SCROLLS || 8),
     navigationTimeoutMs: Number(process.env.NAVIGATION_TIMEOUT_MS || 60000),
-    channel: process.env.PLAYWRIGHT_CHANNEL || undefined
+    channel: process.env.PLAYWRIGHT_CHANNEL || undefined,
+    convert: false,
+    askConvert: false,
+    downloadsDir: process.env.DOWNLOADS_DIR || 'downloads',
+    ytDlpPath: process.env.YT_DLP_PATH || 'yt-dlp',
+    ffmpegLocation: process.env.FFMPEG_LOCATION || undefined,
+    downloadConcurrency: Number(process.env.DOWNLOAD_CONCURRENCY || 1),
+    downloadTimeoutMs: Number(process.env.DOWNLOAD_TIMEOUT_MS || 0),
+    retryFailedDownloads: process.env.RETRY_FAILED_DOWNLOADS === '1' || process.env.RETRY_FAILED_DOWNLOADS === 'true',
+    forceDownload: process.env.FORCE_DOWNLOAD === '1' || process.env.FORCE_DOWNLOAD === 'true',
+    autoConvert: process.env.AUTO_CONVERT === '1' || process.env.AUTO_CONVERT === 'true',
+    downloadLimit: Number(process.env.DOWNLOAD_LIMIT || 0)
   };
 
   for (let index = 0; index < args.length; index += 1) {
@@ -723,10 +781,63 @@ function parseArgs(args) {
       parsed.lessonLoadTimeoutMs = Number(arg.slice('--lesson-load-timeout-ms='.length));
     } else if (arg === '--help' || arg === '-h') {
       printHelpAndExit();
+    } else if (arg === '--convert') {
+      parsed.convert = true;
+    } else if (arg === '--ask-convert') {
+      parsed.askConvert = true;
+    } else if (arg === '--auto-convert') {
+      parsed.autoConvert = true;
+    } else if (arg === '--retry-failed-downloads') {
+      parsed.retryFailedDownloads = true;
+    } else if (arg === '--force-download') {
+      parsed.forceDownload = true;
+    } else if (arg === '--downloads-dir' && next) {
+      parsed.downloadsDir = next;
+      index += 1;
+    } else if (arg.startsWith('--downloads-dir=')) {
+      parsed.downloadsDir = arg.slice('--downloads-dir='.length);
+    } else if (arg === '--yt-dlp-path' && next) {
+      parsed.ytDlpPath = next;
+      index += 1;
+    } else if (arg.startsWith('--yt-dlp-path=')) {
+      parsed.ytDlpPath = arg.slice('--yt-dlp-path='.length);
+    } else if (arg === '--ffmpeg-location' && next) {
+      parsed.ffmpegLocation = next;
+      index += 1;
+    } else if (arg.startsWith('--ffmpeg-location=')) {
+      parsed.ffmpegLocation = arg.slice('--ffmpeg-location='.length);
+    } else if (arg === '--download-concurrency' && next) {
+      parsed.downloadConcurrency = Number(next);
+      index += 1;
+    } else if (arg.startsWith('--download-concurrency=')) {
+      parsed.downloadConcurrency = Number(arg.slice('--download-concurrency='.length));
+    } else if (arg === '--download-timeout-ms' && next) {
+      parsed.downloadTimeoutMs = Number(next);
+      index += 1;
+    } else if (arg.startsWith('--download-timeout-ms=')) {
+      parsed.downloadTimeoutMs = Number(arg.slice('--download-timeout-ms='.length));
+    } else if (arg === '--download-limit' && next) {
+      parsed.downloadLimit = Number(next);
+      index += 1;
+    } else if (arg.startsWith('--download-limit=')) {
+      parsed.downloadLimit = Number(arg.slice('--download-limit='.length));
     } else {
       console.error(`[error] Unknown or incomplete argument: ${arg}`);
       printHelpAndExit(1);
     }
+  }
+
+  if (!Number.isInteger(parsed.downloadConcurrency) || parsed.downloadConcurrency < 1) {
+    console.error('[error] --download-concurrency must be a positive integer.');
+    process.exit(1);
+  }
+  if (Number.isNaN(parsed.downloadTimeoutMs) || parsed.downloadTimeoutMs < 0) {
+    console.error('[error] --download-timeout-ms must be a non-negative number.');
+    process.exit(1);
+  }
+  if (!Number.isInteger(parsed.downloadLimit) || parsed.downloadLimit < 0) {
+    console.error('[error] --download-limit must be a non-negative integer.');
+    process.exit(1);
   }
 
   for (const key of ['navigationTimeoutMs', 'maxAttempts', 'initialSettleMs', 'lessonLoadTimeoutMs', 'captureWindowMs', 'afterFirstHitGraceMs', 'betweenLessonDelayMs', 'retryDelayMs', 'discoveryScrolls']) {
@@ -740,12 +851,24 @@ function parseArgs(args) {
 
 function printHelpAndExit(exitCode = 0) {
   console.log(`Usage:
+  npm start
+  node src/index.js
   npm run crawl -- --url <course-url>
-  npm start -- --url <course-url>
-  npm run start:debug -- --url <course-url>
-  npm start -- --url <course-url> --auto-lessons
+  npm run convert
+  npm run scrape-and-convert -- --url <course-url>
 
 Options:
+  --convert               Convert/download existing videos.json to MP4
+  --ask-convert           Prompt to convert after crawling
+  --auto-convert          Automatically convert after crawling without prompt
+  --downloads-dir <path>  Output directory for MP4s, default: downloads
+  --retry-failed-downloads Retry streams marked as failed
+  --force-download        Redownload even if file exists
+  --yt-dlp-path <path>    Path to yt-dlp executable, default: yt-dlp
+  --ffmpeg-location <path> Path to ffmpeg executable
+  --download-concurrency <n> Number of parallel downloads, default: 1
+  --download-timeout-ms <n> Timeout for yt-dlp process, default: 0 (no timeout)
+  --download-limit <n>    Max number of streams to download, default: 0 (no limit)
   --url <url>             Huawei course page to open
   --debug                 Print request URL, response URL, status, and content-type
   --crawl-learning-page   Parse sidebar menu hierarchically and crawl lessons automatically
@@ -767,7 +890,9 @@ Environment Variables:
   COURSE_URL, DEBUG_HLS_CAPTURE, PROFILE_DIR, LOG_FILE, VIDEOS_FILE,
   AUTO_LESSONS, CRAWL_LEARNING_PAGE, WAIT_FOR_ENTER, RESUME_CAPTURE, RETRY_NO_VIDEO,
   MAX_ATTEMPTS, INITIAL_SETTLE_MS, LESSON_LOAD_TIMEOUT_MS, CAPTURE_WINDOW_MS, AFTER_FIRST_HIT_GRACE_MS,
-  BETWEEN_LESSON_DELAY_MS, RETRY_DELAY_MS, DISCOVERY_SCROLLS, NAVIGATION_TIMEOUT_MS, PLAYWRIGHT_CHANNEL
+  BETWEEN_LESSON_DELAY_MS, RETRY_DELAY_MS, DISCOVERY_SCROLLS, NAVIGATION_TIMEOUT_MS, PLAYWRIGHT_CHANNEL,
+  DOWNLOADS_DIR, YT_DLP_PATH, FFMPEG_LOCATION, DOWNLOAD_CONCURRENCY, DOWNLOAD_TIMEOUT_MS,
+  RETRY_FAILED_DOWNLOADS, FORCE_DOWNLOAD, DOWNLOAD_LIMIT, AUTO_CONVERT
 `);
   process.exit(exitCode);
 }
@@ -1243,3 +1368,423 @@ async function playVideoInMainArea(page, videoIndex) {
   }
   return false;
 }
+
+// --- Interactive Menu & MP4 Convert Logic ---
+
+async function showMainMenu() {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout
+  });
+
+  console.log('\nHuawei HLS Capture\n');
+  console.log('1. Scrape learning page, then optionally convert to MP4');
+  console.log('2. Convert/download existing videos.json to MP4');
+  console.log('3. Exit\n');
+
+  try {
+    const answer = await rl.question('Choose option: ');
+    rl.close();
+
+    const choice = answer.trim();
+    if (choice === '1') {
+      await promptForCourseUrlAndCrawl({ returnToMenu: true });
+    } else if (choice === '2') {
+      await convertVideosFromState({ returnToMenu: true });
+    } else if (choice === '3') {
+      console.log('Exiting...');
+      process.exit(0);
+    } else {
+      console.log('Invalid option.');
+      await showMainMenu();
+    }
+  } catch (error) {
+    rl.close();
+  }
+}
+
+async function promptForCourseUrlAndCrawl({ returnToMenu = true } = {}) {
+  if (options.courseUrl === DEFAULT_COURSE_URL || !options.courseUrl) {
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout
+    });
+    try {
+      const url = await rl.question('Enter course URL: ');
+      if (url.trim()) {
+        options.courseUrl = url.trim();
+      }
+    } finally {
+      rl.close();
+    }
+  }
+
+  options.crawlLearningPage = true;
+  options.askConvert = true;
+  await runCrawlWorkflow();
+  await promptConversionAfterCrawl({ returnToMenu });
+}
+
+async function promptConversionAfterCrawl({ returnToMenu = false } = {}) {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout
+  });
+
+  try {
+    const answer = await rl.question('\nScraping finished. Continue convert/download to MP4? [y/N] ');
+    if (answer.trim().toLowerCase() === 'y') {
+      rl.close();
+      await convertVideosFromState({ returnToMenu });
+    } else {
+      rl.close();
+      if (returnToMenu) {
+        await showMainMenu();
+      }
+    }
+  } catch (error) {
+    rl.close();
+  }
+}
+
+async function convertVideosFromState({ returnToMenu = false } = {}) {
+  console.log('[convert] Loading videos.json...');
+  try {
+    videosState = await loadVideosState();
+  } catch (error) {
+    console.log('videos.json not found. Run scraping first.');
+    if (returnToMenu) {
+      await showMainMenu();
+    }
+    return;
+  }
+
+  const jobs = collectDownloadJobs(videosState);
+  if (jobs.length === 0) {
+    console.log('[convert] No HLS streams found in videos.json.');
+    if (returnToMenu) {
+      await showMainMenu();
+    }
+    return;
+  }
+
+  const courseTitle = videosState.courseTitle || 'Huawei Talent Course';
+  const numModules = videosState.modules ? videosState.modules.length : 0;
+  const numLessons = videosState.modules ? videosState.modules.reduce((sum, m) => sum + (m.lessons ? m.lessons.length : 0), 0) : videosState.lessons.length;
+  
+  let downloaded = 0;
+  let pending = 0;
+  let failed = 0;
+
+  for (const job of jobs) {
+    const status = job.stream.download?.status;
+    if (status === 'completed') downloaded++;
+    else if (status === 'failed') failed++;
+    else pending++;
+  }
+
+  console.log(`\n[convert] Summary:`);
+  console.log(`  Course: ${courseTitle}`);
+  console.log(`  Modules: ${numModules}`);
+  console.log(`  Lessons: ${numLessons}`);
+  console.log(`  HLS Streams: ${jobs.length}`);
+  console.log(`  Already Downloaded: ${downloaded}`);
+  console.log(`  Failed: ${failed}`);
+  console.log(`  Pending: ${pending}`);
+  console.log(`  Output Dir: ${path.resolve(options.downloadsDir)}`);
+
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout
+  });
+
+  let confirm = 'n';
+  try {
+    const answer = await rl.question('\nContinue downloading/converting m3u8 to MP4? [y/N] ');
+    confirm = answer.trim().toLowerCase();
+  } finally {
+    rl.close();
+  }
+
+  if (confirm !== 'y') {
+    if (returnToMenu) {
+      await showMainMenu();
+    }
+    return;
+  }
+
+  const hasYtDlp = await ensureToolAvailable(options.ytDlpPath, ['--version']);
+  if (!hasYtDlp) {
+    console.log('\nyt-dlp was not found. Install it first:');
+    console.log('winget install yt-dlp.yt-dlp');
+    console.log('or:');
+    console.log('pip install -U yt-dlp\n');
+    if (returnToMenu) {
+      await showMainMenu();
+    }
+    return;
+  }
+
+  const ffmpegCheckArgs = options.ffmpegLocation ? ['-version'] : ['-version'];
+  const ffmpegCmd = options.ffmpegLocation || 'ffmpeg';
+  const hasFfmpeg = await ensureToolAvailable(ffmpegCmd, ffmpegCheckArgs);
+  if (!hasFfmpeg) {
+    console.log('[warn] ffmpeg was not found. yt-dlp may fail to merge video and audio.');
+  }
+
+  let successCount = 0;
+  let skipCount = 0;
+  let failCount = 0;
+
+  // Simple concurrency
+  if (options.downloadLimit > 0) {
+    console.log(`[convert] Download limit: ${options.downloadLimit}`);
+  }
+
+  const onInterrupt = async () => {
+    console.log('\n[interrupt] Download interrupted. Saving progress...');
+    await saveVideosState();
+    console.log('[interrupt] Progress saved.');
+    process.exit(0);
+  };
+  process.on('SIGINT', onInterrupt);
+  process.on('SIGTERM', onInterrupt);
+
+  const queue = [...jobs];
+  const workers = [];
+  
+  const worker = async () => {
+    while (queue.length > 0) {
+      if (options.downloadLimit > 0 && successCount >= options.downloadLimit) {
+        queue.length = 0; // stop processing
+        break;
+      }
+      const job = queue.shift();
+      const result = await downloadStreamWithYtDlp(job);
+      if (result === 'completed') successCount++;
+      else if (result === 'skipped') skipCount++;
+      else failCount++;
+    }
+  };
+
+  for (let i = 0; i < options.downloadConcurrency; i++) {
+    workers.push(worker());
+  }
+
+  await Promise.all(workers);
+
+  process.removeListener('SIGINT', onInterrupt);
+  process.removeListener('SIGTERM', onInterrupt);
+
+  console.log(`\n[convert] Done. completed=${successCount} skipped=${skipCount} failed=${failCount}`);
+  
+  if (returnToMenu) {
+    await showMainMenu();
+  }
+}
+
+function collectDownloadJobs(state) {
+  const jobs = [];
+  const courseTitle = state.courseTitle || 'Huawei Talent Course';
+
+  if (state.modules) {
+    for (const mod of state.modules) {
+      for (const lesson of mod.lessons || []) {
+        for (const video of lesson.videos || []) {
+          if (video.m3u8Url) {
+            jobs.push({
+              courseTitle,
+              moduleTitle: mod.moduleTitle,
+              lessonTitle: lesson.lessonTitle,
+              stream: video
+            });
+          }
+        }
+      }
+    }
+  } else if (state.lessons) {
+    for (const lesson of state.lessons) {
+      for (const url of lesson.m3u8Urls || []) {
+        jobs.push({
+          courseTitle,
+          moduleTitle: 'Lessons',
+          lessonTitle: lesson.title,
+          stream: { m3u8Url: url, videoTitle: lesson.title, download: lesson.download }
+        });
+      }
+    }
+  }
+  return jobs;
+}
+
+function sanitizePathSegment(value) {
+  if (!value) return 'Unknown';
+  let sanitized = value.replace(/[<>:"/\\|?*]/g, '');
+  sanitized = sanitized.replace(/\s+/g, ' ').trim();
+  const upper = sanitized.toUpperCase();
+  const reserved = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/;
+  if (reserved.test(upper)) {
+    sanitized = `_${sanitized}`;
+  }
+  if (sanitized === '' || sanitized === '.' || sanitized === '..') {
+    sanitized = 'Unknown';
+  }
+  return sanitized.substring(0, 100);
+}
+
+function buildDownloadOutputPath(job) {
+  const course = sanitizePathSegment(job.courseTitle);
+  const mod = sanitizePathSegment(job.moduleTitle);
+  const lesson = sanitizePathSegment(job.lessonTitle);
+  const streamName = sanitizePathSegment(job.stream.videoTitle || 'Stream');
+  
+  const base = path.join(options.downloadsDir, course, mod, lesson);
+  return path.join(base, `${streamName}.mp4`);
+}
+
+async function fileExistsWithSize(filePath) {
+  try {
+    const s = await stat(filePath);
+    return s.isFile() && s.size > 0;
+  } catch (e) {
+    return false;
+  }
+}
+
+function ensureToolAvailable(command, args) {
+  return new Promise((resolve) => {
+    const proc = spawn(command, args, { stdio: 'ignore', shell: false });
+    proc.on('error', () => resolve(false));
+    proc.on('close', (code) => resolve(code === 0));
+  });
+}
+
+function runYtDlp(args, onProgress) {
+  return new Promise((resolve) => {
+    const proc = spawn(options.ytDlpPath, args, { stdio: ['ignore', 'ignore', 'pipe'], shell: false });
+    
+    let errorOutput = '';
+    proc.stderr.on('data', (data) => {
+      const lines = data.toString().split('\n');
+      for (const line of lines) {
+        if (line.includes('[download]') && line.includes('%')) {
+          if (onProgress) onProgress(line.trim());
+        } else {
+          errorOutput += line + '\n';
+        }
+      }
+    });
+
+    if (options.downloadTimeoutMs > 0) {
+      setTimeout(() => {
+        proc.kill('SIGKILL');
+        resolve({ success: false, error: 'Process timed out' });
+      }, options.downloadTimeoutMs);
+    }
+
+    proc.on('error', (err) => resolve({ success: false, error: err.message }));
+    proc.on('close', (code) => {
+      if (code === 0) resolve({ success: true });
+      else resolve({ success: false, error: `yt-dlp exited with code ${code}. ${errorOutput.trim().substring(0, 200)}` });
+    });
+  });
+}
+
+async function downloadStreamWithYtDlp(job) {
+  const stream = job.stream;
+  const title = stream.videoTitle || job.lessonTitle || 'Stream';
+  
+  const outputFile = buildDownloadOutputPath(job);
+  const fileExists = await fileExistsWithSize(outputFile);
+  
+  stream.download ??= {};
+
+  if (fileExists && !options.forceDownload) {
+    console.log(`[download] SKIP already exists: ${outputFile}`);
+    stream.download.status = 'completed';
+    stream.download.outputFile = outputFile;
+    stream.download.error = null;
+    await saveVideosState();
+    return 'skipped';
+  }
+
+  if (stream.download.status === 'completed' && !options.forceDownload && !fileExists) {
+    // metadata says completed but file is missing -> redownload
+  } else if (stream.download.status === 'completed' && !options.forceDownload) {
+    console.log(`[download] SKIP marked completed: ${title}`);
+    return 'skipped';
+  }
+
+  if (stream.download.status === 'failed' && !options.retryFailedDownloads && !options.forceDownload) {
+    console.log(`[download] SKIP previously failed (use --retry-failed-downloads): ${title}`);
+    return 'skipped';
+  }
+
+  console.log(`[download] ${title}`);
+  
+  stream.download.status = 'in_progress';
+  stream.download.startedAt = toWIB();
+  stream.download.outputFile = outputFile;
+  stream.download.error = null;
+  await saveVideosState();
+
+  await mkdir(path.dirname(outputFile), { recursive: true });
+
+  const args = [
+    stream.m3u8Url,
+    '-o', outputFile,
+    '--merge-output-format', 'mp4',
+    '--continue',
+    '--no-overwrites',
+    '--newline',
+    '--progress'
+  ];
+
+  if (options.ffmpegLocation) {
+    args.push('--ffmpeg-location', options.ffmpegLocation);
+  }
+
+  const result = await runYtDlp(args, (line) => {
+    const progressMatch = line.match(/\[download\]\s+([\d.]+)%\s+of\s+([~]?[\d.]+[A-Za-z]+)(?:\s+at\s+([\d.]+[A-Za-z]+\/s))?(?:\s+ETA\s+([\d:]+))?/);
+    if (progressMatch) {
+      const percent = progressMatch[1];
+      const totalSize = progressMatch[2];
+      const speed = progressMatch[3] || 'N/A';
+      const eta = progressMatch[4] || 'N/A';
+      
+      stream.download.percent = percent;
+      stream.download.totalSize = totalSize;
+      stream.download.speed = speed;
+      stream.download.eta = eta;
+      
+      process.stdout.write(`\r[download] ${title.substring(0, 30)}: ${percent}% | ${totalSize} | ${speed} | ETA ${eta}`.padEnd(80));
+    }
+  });
+
+  if (stream.download.percent) {
+    console.log(''); // newline after progress
+  }
+
+  if (result.success) {
+    console.log(`[download] OK ${outputFile}`);
+    stream.download.status = 'completed';
+    stream.download.completedAt = toWIB();
+    stream.download.error = null;
+    await saveVideosState();
+    return 'completed';
+  } else {
+    // If forbidden/expired
+    const isExpired = result.error.includes('403') || result.error.includes('Forbidden') || result.error.includes('HTTP Error 40');
+    let errMsg = result.error;
+    if (isExpired) {
+      errMsg = 'URL is expired/inaccessible. Re-scrape to get fresh URLs.';
+    }
+
+    console.log(`[download] FAIL ${title}: ${errMsg}`);
+    stream.download.status = 'failed';
+    stream.download.error = errMsg;
+    await saveVideosState();
+    return 'failed';
+  }
+}
+
