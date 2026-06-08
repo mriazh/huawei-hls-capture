@@ -237,6 +237,29 @@ async function collectIfHlsCandidate(candidate) {
   }
 }
 
+function getLessonKey(lesson) {
+  return lesson.lessonId || lesson.fingerprint || lesson.id;
+}
+
+function normalizeHierarchicalLessonIds(modules) {
+  for (const mod of modules || []) {
+    for (const lesson of mod.lessons || []) {
+      lesson.lessonId ??= lesson.fingerprint || lesson.id;
+    }
+  }
+}
+
+function normalizeLessonVideoTitles(lesson) {
+  lesson.videos ??= [];
+  if (lesson.videos.length === 1) {
+    lesson.videos[0].videoTitle = lesson.lessonTitle;
+  } else if (lesson.videos.length > 1) {
+    lesson.videos.forEach((video, index) => {
+      video.videoTitle = `${lesson.lessonTitle} - Part ${index + 1}`;
+    });
+  }
+}
+
 async function attachUrlToActiveLesson({ url, timestamp, source, status, contentType }) {
   if (!activeCapture || !videosState) {
     return;
@@ -245,11 +268,11 @@ async function attachUrlToActiveLesson({ url, timestamp, source, status, content
   let lesson = null;
   if (options.crawlLearningPage) {
     for (const mod of (videosState.modules || [])) {
-      lesson = mod.lessons.find((l) => l.lessonId === activeCapture.lessonId);
+      lesson = mod.lessons.find((l) => getLessonKey(l) === activeCapture.lessonId);
       if (lesson) break;
     }
   } else {
-    lesson = videosState.lessons.find((item) => item.id === activeCapture.lessonId);
+    lesson = videosState.lessons.find((item) => getLessonKey(item) === activeCapture.lessonId);
   }
 
   if (!lesson) {
@@ -261,16 +284,23 @@ async function attachUrlToActiveLesson({ url, timestamp, source, status, content
     const streamIndex = lesson.videos.length + 1;
     const existingVideo = lesson.videos.find((v) => v.m3u8Url === url);
     if (existingVideo) return;
+
+    if (options.maxStreamsPerLesson > 0 && lesson.videos.length >= options.maxStreamsPerLesson) {
+      logDetail(`[capture] Ignoring extra HLS URL for ${lesson.lessonTitle}; max streams per lesson reached (${options.maxStreamsPerLesson}).`);
+      return;
+    }
     
     lesson.videos.push({
       videoIndex: streamIndex,
-      videoTitle: `${lesson.lessonTitle} - Stream ${streamIndex}`,
+      videoTitle: lesson.lessonTitle,
       m3u8Url: url,
       timestamp,
       source,
       status,
       contentType
     });
+
+    normalizeLessonVideoTitles(lesson);
     // Let the main flow handle setting status='completed' 
     // to avoid premature completion if we want to wait for more streams.
     lesson.hasVideo = true;
@@ -540,13 +570,34 @@ async function clickVisiblePlayButton(page) {
 }
 
 async function waitForCaptureWindow(capture) {
-  const deadline = Date.now() + options.captureWindowMs;
-  while (Date.now() < deadline) {
-    if (capture.foundUrls.size > 0) {
-      await new Promise((resolve) => setTimeout(resolve, options.afterFirstHitGraceMs));
+  const start = Date.now();
+  let firstHitAt = null;
+  let lastHitCount = 0;
+  let lastHitAt = null;
+
+  while (Date.now() - start < options.captureWindowMs) {
+    const count = capture.foundUrls.size;
+
+    if (count > 0 && !firstHitAt) {
+      firstHitAt = Date.now();
+      lastHitAt = firstHitAt;
+      lastHitCount = count;
+    }
+
+    if (count > lastHitCount) {
+      lastHitAt = Date.now();
+      lastHitCount = count;
+    }
+
+    if (options.maxStreamsPerLesson > 0 && count >= options.maxStreamsPerLesson) {
       return;
     }
-    await new Promise((resolve) => setTimeout(resolve, 500));
+
+    if (firstHitAt && Date.now() - lastHitAt >= options.afterFirstHitGraceMs) {
+      return;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 250));
   }
 }
 
@@ -688,6 +739,7 @@ function parseArgs(args) {
     profileDir: process.env.PROFILE_DIR || 'playwright-profile',
     logFile: process.env.LOG_FILE || 'urls.log',
     videosFile: process.env.VIDEOS_FILE || 'videos.json',
+    maxStreamsPerLesson: Number(process.env.MAX_STREAMS_PER_LESSON || 0),
     autoLessons: process.env.AUTO_LESSONS === '1' || process.env.AUTO_LESSONS === 'true',
     crawlLearningPage: process.env.CRAWL_LEARNING_PAGE === '1' || process.env.CRAWL_LEARNING_PAGE === 'true',
     waitForEnter: process.env.WAIT_FOR_ENTER !== '0' && process.env.WAIT_FOR_ENTER !== 'false',
@@ -769,6 +821,11 @@ function parseArgs(args) {
       index += 1;
     } else if (arg.startsWith('--max-attempts=')) {
       parsed.maxAttempts = Number(arg.slice('--max-attempts='.length));
+    } else if (arg === '--max-streams-per-lesson' && next) {
+      parsed.maxStreamsPerLesson = Number(next);
+      index += 1;
+    } else if (arg.startsWith('--max-streams-per-lesson=')) {
+      parsed.maxStreamsPerLesson = Number(arg.slice('--max-streams-per-lesson='.length));
     } else if (arg === '--capture-window-ms' && next) {
       parsed.captureWindowMs = Number(next);
       index += 1;
@@ -846,6 +903,11 @@ function parseArgs(args) {
     }
   }
 
+  if (!Number.isInteger(parsed.maxStreamsPerLesson) || parsed.maxStreamsPerLesson < 0) {
+    console.error('[error] --max-streams-per-lesson must be a non-negative integer.');
+    process.exit(1);
+  }
+
   return parsed;
 }
 
@@ -878,6 +940,7 @@ Options:
   --no-resume             Ignore existing videos.json and rebuild state
   --retry-no-video        Retry lessons marked as no_video on resume
   --max-attempts <n>      Retry attempts per lesson, default: 3
+  --max-streams-per-lesson <n> Max HLS streams captured per lesson, default: 0 (no limit)
   --capture-window-ms <n> Wait time for HLS after clicking lesson, default: 20000
   --after-first-hit-grace-ms <n> Extra wait time after first m3u8 is found, default: 5000
   --lesson-load-timeout-ms <n> Wait after clicking lesson before capture, default: 5000
@@ -889,7 +952,7 @@ Options:
 Environment Variables:
   COURSE_URL, DEBUG_HLS_CAPTURE, PROFILE_DIR, LOG_FILE, VIDEOS_FILE,
   AUTO_LESSONS, CRAWL_LEARNING_PAGE, WAIT_FOR_ENTER, RESUME_CAPTURE, RETRY_NO_VIDEO,
-  MAX_ATTEMPTS, INITIAL_SETTLE_MS, LESSON_LOAD_TIMEOUT_MS, CAPTURE_WINDOW_MS, AFTER_FIRST_HIT_GRACE_MS,
+  MAX_ATTEMPTS, MAX_STREAMS_PER_LESSON, INITIAL_SETTLE_MS, LESSON_LOAD_TIMEOUT_MS, CAPTURE_WINDOW_MS, AFTER_FIRST_HIT_GRACE_MS,
   BETWEEN_LESSON_DELAY_MS, RETRY_DELAY_MS, DISCOVERY_SCROLLS, NAVIGATION_TIMEOUT_MS, PLAYWRIGHT_CHANNEL,
   DOWNLOADS_DIR, YT_DLP_PATH, FFMPEG_LOCATION, DOWNLOAD_CONCURRENCY, DOWNLOAD_TIMEOUT_MS,
   RETRY_FAILED_DOWNLOADS, FORCE_DOWNLOAD, DOWNLOAD_LIMIT, AUTO_CONVERT
@@ -916,6 +979,7 @@ async function crawlLearningPageFlow(page) {
 
   logDetail('[crawl] Building hierarchy from sidebar...');
   const modules = await buildSidebarHierarchy(page);
+  normalizeHierarchicalLessonIds(modules);
   videosState.modules = modules;
   await saveVideosState();
 
@@ -1185,7 +1249,6 @@ async function processHierarchicalLessons(page) {
     }
   }
 }
-
 async function processHierarchicalLesson(page, lesson) {
   for (let attempt = 1; attempt <= options.maxAttempts; attempt++) {
     lesson.status = 'in_progress';
@@ -1196,11 +1259,14 @@ async function processHierarchicalLesson(page, lesson) {
     try {
       // Set activeCapture BEFORE clicking so network interceptor catches m3u8 during page load
       activeCapture = {
-        lessonId: lesson.lessonId,
-        videoIndex: 1,
+        lessonId: getLessonKey(lesson),
         startedAt: Date.now(),
         foundUrls: new Set()
       };
+
+      if (!activeCapture.lessonId) {
+        throw new Error(`Lesson key missing for ${lesson.lessonTitle}`);
+      }
 
       // Re-expand sidebar because Huawei collapses other BABs/sub-BABs after each click
       await expandSidebarItems(page);
@@ -1221,6 +1287,7 @@ async function processHierarchicalLesson(page, lesson) {
       if (activeCapture.foundUrls.size > 0) {
         lesson.status = 'completed';
         lesson.hasVideo = true;
+        normalizeLessonVideoTitles(lesson);
         logClean(`  [-] ${lesson.lessonTitle} -> [OK] m3u8 captured (${activeCapture.foundUrls.size} URLs)`);
       } else {
         lesson.status = 'no_video';
@@ -1651,6 +1718,25 @@ async function fileExistsWithSize(filePath) {
   }
 }
 
+function formatBytes(bytes) {
+  if (!bytes || isNaN(bytes)) return '0 B';
+  const k = 1024;
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
+
+function formatEta(seconds) {
+  if (seconds == null || isNaN(seconds)) return 'N/A';
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  if (h > 0) {
+    return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+  }
+  return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+}
+
 function ensureToolAvailable(command, args) {
   return new Promise((resolve) => {
     const proc = spawn(command, args, { stdio: 'ignore', shell: false });
@@ -1659,33 +1745,127 @@ function ensureToolAvailable(command, args) {
   });
 }
 
-function runYtDlp(args, onProgress) {
+const IMPORTANT_STATUS_MARKERS = [
+  '[download] Destination',
+  '[download] Downloading',
+  '[Merger]',
+  '[FixupM3u8]',
+  '[VideoRemuxer]',
+  '[ExtractAudio]',
+  '[MoveFiles]',
+  '[ffmpeg]',
+  'Merging formats into',
+  'Fixing MPEG-TS',
+  'Deleting original file',
+  'has already been downloaded'
+];
+
+const POSTPROCESS_MARKERS = [
+  '[Merger]',
+  '[FixupM3u8]',
+  '[VideoRemuxer]',
+  '[ExtractAudio]',
+  '[MoveFiles]',
+  '[ffmpeg]',
+  'Merging formats into',
+  'Fixing MPEG-TS',
+  'Deleting original file'
+];
+
+function isImportantStatusLine(line) {
+  return IMPORTANT_STATUS_MARKERS.some((marker) => line.includes(marker));
+}
+
+function runYtDlp(args, onProgress, onStatus) {
   return new Promise((resolve) => {
-    const proc = spawn(options.ytDlpPath, args, { stdio: ['ignore', 'ignore', 'pipe'], shell: false });
-    
+    const proc = spawn(options.ytDlpPath, args, { stdio: ['ignore', 'pipe', 'pipe'], shell: false });
+
     let errorOutput = '';
-    proc.stderr.on('data', (data) => {
-      const lines = data.toString().split('\n');
-      for (const line of lines) {
-        if (line.includes('[download]') && line.includes('%')) {
-          if (onProgress) onProgress(line.trim());
-        } else {
-          errorOutput += line + '\n';
+    let stdoutRemainder = '';
+    let stderrRemainder = '';
+    let settled = false;
+    let timeoutId = null;
+
+    const handleOutputLine = (rawLine, source) => {
+      const line = rawLine.trim();
+      if (!line) return;
+
+      if (line.includes('~ytdlp-progress-')) {
+        const marker = '~ytdlp-progress-';
+        const markerIndex = line.indexOf(marker);
+        const jsonStr = line.slice(markerIndex + marker.length);
+
+        try {
+          const progress = JSON.parse(jsonStr);
+          if (onProgress) onProgress(progress);
+        } catch {
+          // Ignore malformed progress output.
         }
+      } else if (isImportantStatusLine(line)) {
+        if (onStatus) onStatus(line);
+      } else if (source === 'stderr') {
+        errorOutput += line + '\n';
       }
-    });
+    };
+
+    const handleOutputChunk = (data, source) => {
+      const text = data.toString();
+      const current = (source === 'stdout' ? stdoutRemainder : stderrRemainder) + text;
+      const parts = current.split(/\r?\n|\r/);
+      const remainder = parts.pop() || '';
+
+      if (source === 'stdout') {
+        stdoutRemainder = remainder;
+      } else {
+        stderrRemainder = remainder;
+      }
+
+      for (const rawLine of parts) {
+        handleOutputLine(rawLine, source);
+      }
+    };
+
+    const flushRemainder = () => {
+      if (stdoutRemainder.trim()) {
+        handleOutputLine(stdoutRemainder, 'stdout');
+        stdoutRemainder = '';
+      }
+      if (stderrRemainder.trim()) {
+        handleOutputLine(stderrRemainder, 'stderr');
+        stderrRemainder = '';
+      }
+    };
+
+    proc.stdout.on('data', (data) => handleOutputChunk(data, 'stdout'));
+    proc.stderr.on('data', (data) => handleOutputChunk(data, 'stderr'));
+
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      if (timeoutId) clearTimeout(timeoutId);
+      resolve(result);
+    };
 
     if (options.downloadTimeoutMs > 0) {
-      setTimeout(() => {
+      timeoutId = setTimeout(() => {
         proc.kill('SIGKILL');
-        resolve({ success: false, error: 'Process timed out' });
+        finish({ success: false, error: 'Process timed out' });
       }, options.downloadTimeoutMs);
     }
 
-    proc.on('error', (err) => resolve({ success: false, error: err.message }));
+    proc.on('error', (err) => finish({ success: false, error: err.message }));
+
     proc.on('close', (code) => {
-      if (code === 0) resolve({ success: true });
-      else resolve({ success: false, error: `yt-dlp exited with code ${code}. ${errorOutput.trim().substring(0, 200)}` });
+      flushRemainder();
+
+      if (code === 0) {
+        finish({ success: true });
+      } else {
+        finish({
+          success: false,
+          error: `yt-dlp exited with code ${code}. ${errorOutput.trim().substring(0, 200)}`
+        });
+      }
     });
   });
 }
@@ -1721,6 +1901,7 @@ async function downloadStreamWithYtDlp(job) {
   }
 
   console.log(`[download] ${title}`);
+  console.log('[stage] Downloading...');
   
   stream.download.status = 'in_progress';
   stream.download.startedAt = toWIB();
@@ -1736,36 +1917,61 @@ async function downloadStreamWithYtDlp(job) {
     '--merge-output-format', 'mp4',
     '--continue',
     '--no-overwrites',
+    '--progress',
     '--newline',
-    '--progress'
+    '--progress-template', '~ytdlp-progress-%(progress)j'
   ];
 
   if (options.ffmpegLocation) {
     args.push('--ffmpeg-location', options.ffmpegLocation);
   }
 
-  const result = await runYtDlp(args, (line) => {
-    const progressMatch = line.match(/\[download\]\s+([\d.]+)%\s+of\s+([~]?[\d.]+[A-Za-z]+)(?:\s+at\s+([\d.]+[A-Za-z]+\/s))?(?:\s+ETA\s+([\d:]+))?/);
-    if (progressMatch) {
-      const percent = progressMatch[1];
-      const totalSize = progressMatch[2];
-      const speed = progressMatch[3] || 'N/A';
-      const eta = progressMatch[4] || 'N/A';
-      
-      stream.download.percent = percent;
-      stream.download.totalSize = totalSize;
-      stream.download.speed = speed;
-      stream.download.eta = eta;
-      
-      process.stdout.write(`\r[download] ${title.substring(0, 30)}: ${percent}% | ${totalSize} | ${speed} | ETA ${eta}`.padEnd(80));
+  let postprocessAnnounced = false;
+  let wroteProgress = false;
+
+  const result = await runYtDlp(args, (progress) => {
+    wroteProgress = true;
+    const downloaded = progress.downloaded_bytes || 0;
+    const total = progress.total_bytes || progress.total_bytes_estimate || 0;
+    
+    let percentStr = '0.0';
+    if (total > 0) {
+      percentStr = ((downloaded / total) * 100).toFixed(1);
+    }
+    
+    const sizeStr = `${formatBytes(downloaded)} / ${total > 0 ? formatBytes(total) : 'Unknown'}`;
+    const speedStr = progress.speed ? `${formatBytes(progress.speed)}/s` : 'N/A';
+    const etaStr = progress.eta != null ? formatEta(progress.eta) : 'N/A';
+    
+    stream.download.percent = percentStr;
+    stream.download.totalSize = sizeStr;
+    stream.download.speed = speedStr;
+    stream.download.eta = etaStr;
+    
+    process.stdout.write(`\r[download] ${title.substring(0, 30)}: ${percentStr}% | ${sizeStr} | ${speedStr} | ETA ${etaStr}`.padEnd(100));
+  }, (line) => {
+    if (wroteProgress) {
+      console.log('');
+      wroteProgress = false;
+    }
+    const isPostprocess = POSTPROCESS_MARKERS.some((marker) => line.includes(marker));
+    if (isPostprocess && !postprocessAnnounced) {
+      console.log('[stage] Post-processing/remuxing...');
+      postprocessAnnounced = true;
+    }
+    if (isPostprocess) {
+      console.log(`[postprocess] ${line}`);
+    } else {
+      console.log(`[yt-dlp] ${line}`);
     }
   });
 
-  if (stream.download.percent) {
+  if (wroteProgress || stream.download.percent) {
     console.log(''); // newline after progress
   }
 
   if (result.success) {
+    console.log('[stage] Completed.');
     console.log(`[download] OK ${outputFile}`);
     stream.download.status = 'completed';
     stream.download.completedAt = toWIB();

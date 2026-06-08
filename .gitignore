@@ -15,3 +15,10 @@ test_logic.js
 verify_dump.js
 downloads/
 scratch/
+downloads-final/
+downloads-stage-test/
+videos-fixed-*.json
+urls*.log
+*.backup.json
+prompt_for_gemini.md
+videos-fixed.json
