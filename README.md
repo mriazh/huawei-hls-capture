@@ -106,6 +106,19 @@ downloads/
 - If you want to force redownloading already completed streams, use `--force-download`.
 - `videos.json` is incrementally updated after each download so you won't lose progress if the script stops.
 
+## Maintenance and Verification
+
+To verify that metadata perfectly matches the physical `.mp4` files and generate a structured JSON or Markdown report:
+```powershell
+node src/index.js --verify-downloads --videos-file videos-fixed-3.json --downloads-dir downloads-final
+node src/index.js --verify-downloads --videos-file videos-fixed-3.json --downloads-dir downloads-final --report-file download-report.md
+```
+
+To clean up leftover `yt-dlp` partial/temporary files after an interrupted download (this will ask for confirmation before deleting):
+```powershell
+node src/index.js --clean-temp-files --downloads-dir downloads-final
+```
+
 ## CLI Options
 
 ```text
@@ -118,6 +131,12 @@ downloads/
 --ffmpeg-location <path>  Path to ffmpeg executable
 --download-concurrency <n> Number of parallel downloads, default: 1
 --download-timeout-ms <n> Timeout for yt-dlp process, default: 0 (no timeout)
+--verify-downloads        Verify videos metadata against physical MP4 files
+--clean-temp-files        Delete leftover yt-dlp temporary files in downloads dir
+--clean-force             Bypass confirmation prompt when cleaning temp files
+--report-file <path>      Write verification report JSON or Markdown, default: download-report.json
+--postprocess-retries <n> Retry file-lock postprocess failures, default: 3
+--postprocess-retry-delay-ms <n> Delay between postprocess retries, default: 5000
 --url <url>               Huawei course page to open
 --debug                   Print request URL, response URL, status, and content-type
 --crawl-learning-page     Parse sidebar menu hierarchically and crawl lessons automatically

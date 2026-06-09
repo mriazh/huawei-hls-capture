@@ -1,5 +1,5 @@
 import { chromium } from 'playwright';
-import { appendFile, mkdir, readFile, writeFile, stat } from 'node:fs/promises';
+import { appendFile, mkdir, readFile, writeFile, stat, readdir, unlink } from 'node:fs/promises';
 import { writeFileSync } from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
@@ -75,6 +75,16 @@ async function main() {
 
   const isExplicitConvert = options.convert;
   const isExplicitCrawl = options.crawlLearningPage || options.autoLessons || process.argv.slice(2).some(arg => arg.startsWith('--url'));
+
+  if (options.verifyDownloads) {
+    await verifyDownloadsFlow();
+    return;
+  }
+
+  if (options.cleanTempFiles) {
+    await cleanTempFilesFlow();
+    return;
+  }
 
   if (isExplicitConvert) {
     await convertVideosFromState({ returnToMenu: false });
@@ -765,7 +775,13 @@ function parseArgs(args) {
     retryFailedDownloads: process.env.RETRY_FAILED_DOWNLOADS === '1' || process.env.RETRY_FAILED_DOWNLOADS === 'true',
     forceDownload: process.env.FORCE_DOWNLOAD === '1' || process.env.FORCE_DOWNLOAD === 'true',
     autoConvert: process.env.AUTO_CONVERT === '1' || process.env.AUTO_CONVERT === 'true',
-    downloadLimit: Number(process.env.DOWNLOAD_LIMIT || 0)
+    downloadLimit: Number(process.env.DOWNLOAD_LIMIT || 0),
+    verifyDownloads: false,
+    cleanTempFiles: false,
+    cleanForce: false,
+    reportFile: process.env.REPORT_FILE || 'download-report.json',
+    postprocessRetries: Number(process.env.POSTPROCESS_RETRIES || 3),
+    postprocessRetryDelayMs: Number(process.env.POSTPROCESS_RETRY_DELAY_MS || 5000)
   };
 
   for (let index = 0; index < args.length; index += 1) {
@@ -878,6 +894,27 @@ function parseArgs(args) {
       index += 1;
     } else if (arg.startsWith('--download-limit=')) {
       parsed.downloadLimit = Number(arg.slice('--download-limit='.length));
+    } else if (arg === '--verify-downloads') {
+      parsed.verifyDownloads = true;
+    } else if (arg === '--clean-temp-files') {
+      parsed.cleanTempFiles = true;
+    } else if (arg === '--clean-force') {
+      parsed.cleanForce = true;
+    } else if (arg === '--report-file' && next) {
+      parsed.reportFile = next;
+      index += 1;
+    } else if (arg.startsWith('--report-file=')) {
+      parsed.reportFile = arg.slice('--report-file='.length);
+    } else if (arg === '--postprocess-retries' && next) {
+      parsed.postprocessRetries = Number(next);
+      index += 1;
+    } else if (arg.startsWith('--postprocess-retries=')) {
+      parsed.postprocessRetries = Number(arg.slice('--postprocess-retries='.length));
+    } else if (arg === '--postprocess-retry-delay-ms' && next) {
+      parsed.postprocessRetryDelayMs = Number(next);
+      index += 1;
+    } else if (arg.startsWith('--postprocess-retry-delay-ms=')) {
+      parsed.postprocessRetryDelayMs = Number(arg.slice('--postprocess-retry-delay-ms='.length));
     } else {
       console.error(`[error] Unknown or incomplete argument: ${arg}`);
       printHelpAndExit(1);
@@ -894,6 +931,14 @@ function parseArgs(args) {
   }
   if (!Number.isInteger(parsed.downloadLimit) || parsed.downloadLimit < 0) {
     console.error('[error] --download-limit must be a non-negative integer.');
+    process.exit(1);
+  }
+  if (!Number.isInteger(parsed.postprocessRetries) || parsed.postprocessRetries < 0) {
+    console.error('[error] --postprocess-retries must be a non-negative integer.');
+    process.exit(1);
+  }
+  if (Number.isNaN(parsed.postprocessRetryDelayMs) || parsed.postprocessRetryDelayMs < 0) {
+    console.error('[error] --postprocess-retry-delay-ms must be a non-negative number.');
     process.exit(1);
   }
 
@@ -931,6 +976,12 @@ Options:
   --download-concurrency <n> Number of parallel downloads, default: 1
   --download-timeout-ms <n> Timeout for yt-dlp process, default: 0 (no timeout)
   --download-limit <n>    Max number of streams to download, default: 0 (no limit)
+  --verify-downloads      Verify videos metadata against physical MP4 files
+  --clean-temp-files      Delete leftover yt-dlp temporary files in downloads dir
+  --clean-force           Bypass confirmation prompt when cleaning temp files
+  --report-file <path>    Write verification report JSON or Markdown, default: download-report.json
+  --postprocess-retries <n> Retry file-lock postprocess failures, default: 3
+  --postprocess-retry-delay-ms <n> Delay between postprocess retries, default: 5000
   --url <url>             Huawei course page to open
   --debug                 Print request URL, response URL, status, and content-type
   --crawl-learning-page   Parse sidebar menu hierarchically and crawl lessons automatically
@@ -955,7 +1006,8 @@ Environment Variables:
   MAX_ATTEMPTS, MAX_STREAMS_PER_LESSON, INITIAL_SETTLE_MS, LESSON_LOAD_TIMEOUT_MS, CAPTURE_WINDOW_MS, AFTER_FIRST_HIT_GRACE_MS,
   BETWEEN_LESSON_DELAY_MS, RETRY_DELAY_MS, DISCOVERY_SCROLLS, NAVIGATION_TIMEOUT_MS, PLAYWRIGHT_CHANNEL,
   DOWNLOADS_DIR, YT_DLP_PATH, FFMPEG_LOCATION, DOWNLOAD_CONCURRENCY, DOWNLOAD_TIMEOUT_MS,
-  RETRY_FAILED_DOWNLOADS, FORCE_DOWNLOAD, DOWNLOAD_LIMIT, AUTO_CONVERT
+  RETRY_FAILED_DOWNLOADS, FORCE_DOWNLOAD, DOWNLOAD_LIMIT, AUTO_CONVERT,
+  REPORT_FILE, POSTPROCESS_RETRIES, POSTPROCESS_RETRY_DELAY_MS
 `);
   process.exit(exitCode);
 }
@@ -1544,10 +1596,15 @@ async function convertVideosFromState({ returnToMenu = false } = {}) {
   let failed = 0;
 
   for (const job of jobs) {
-    const status = job.stream.download?.status;
-    if (status === 'completed') downloaded++;
-    else if (status === 'failed') failed++;
-    else pending++;
+    const outputFile = buildDownloadOutputPath(job);
+    const exists = await fileExistsWithSize(outputFile);
+    if (exists) {
+      downloaded++;
+    } else {
+      const status = job.stream.download?.status;
+      if (status === 'failed') failed++;
+      else pending++;
+    }
   }
 
   console.log(`\n[convert] Summary:`);
@@ -1928,46 +1985,83 @@ async function downloadStreamWithYtDlp(job) {
 
   let postprocessAnnounced = false;
   let wroteProgress = false;
+  let result = null;
 
-  const result = await runYtDlp(args, (progress) => {
-    wroteProgress = true;
-    const downloaded = progress.downloaded_bytes || 0;
-    const total = progress.total_bytes || progress.total_bytes_estimate || 0;
-    
-    let percentStr = '0.0';
-    if (total > 0) {
-      percentStr = ((downloaded / total) * 100).toFixed(1);
+  stream.download.attempts = (stream.download.attempts || 0) + 1;
+  stream.download.lastAttemptAt = toWIB();
+  stream.download.retryCount = 0;
+
+  for (let attempt = 0; attempt <= options.postprocessRetries; attempt++) {
+    const currentArgs = [...args];
+    if (attempt > 0) {
+      currentArgs.push('-k');
+      console.log(`[retry] File lock/postprocess failure. Retrying ${attempt}/${options.postprocessRetries} in ${options.postprocessRetryDelayMs}ms...`);
+      await new Promise((resolve) => setTimeout(resolve, options.postprocessRetryDelayMs));
+      stream.download.retryCount = attempt;
+      stream.download.attempts++;
+      stream.download.lastAttemptAt = toWIB();
+      await saveVideosState();
     }
-    
-    const sizeStr = `${formatBytes(downloaded)} / ${total > 0 ? formatBytes(total) : 'Unknown'}`;
-    const speedStr = progress.speed ? `${formatBytes(progress.speed)}/s` : 'N/A';
-    const etaStr = progress.eta != null ? formatEta(progress.eta) : 'N/A';
-    
-    stream.download.percent = percentStr;
-    stream.download.totalSize = sizeStr;
-    stream.download.speed = speedStr;
-    stream.download.eta = etaStr;
-    
-    process.stdout.write(`\r[download] ${title.substring(0, 30)}: ${percentStr}% | ${sizeStr} | ${speedStr} | ETA ${etaStr}`.padEnd(100));
-  }, (line) => {
-    if (wroteProgress) {
-      console.log('');
+
+    result = await runYtDlp(currentArgs, (progress) => {
+      wroteProgress = true;
+      const downloaded = progress.downloaded_bytes || 0;
+      const total = progress.total_bytes || progress.total_bytes_estimate || 0;
+      
+      let percentStr = '0.0';
+      if (total > 0) {
+        percentStr = ((downloaded / total) * 100).toFixed(1);
+      }
+      
+      const sizeStr = `${formatBytes(downloaded)} / ${total > 0 ? formatBytes(total) : 'Unknown'}`;
+      const speedStr = progress.speed ? `${formatBytes(progress.speed)}/s` : 'N/A';
+      const etaStr = progress.eta != null ? formatEta(progress.eta) : 'N/A';
+      
+      stream.download.percent = percentStr;
+      stream.download.totalSize = sizeStr;
+      stream.download.speed = speedStr;
+      stream.download.eta = etaStr;
+      
+      process.stdout.write(`\r[download] ${title.substring(0, 30)}: ${percentStr}% | ${sizeStr} | ${speedStr} | ETA ${etaStr}`.padEnd(100));
+    }, (line) => {
+      if (wroteProgress) {
+        console.log('');
+        wroteProgress = false;
+      }
+      const isPostprocess = POSTPROCESS_MARKERS.some((marker) => line.includes(marker));
+      if (isPostprocess && !postprocessAnnounced) {
+        console.log('[stage] Post-processing/remuxing...');
+        postprocessAnnounced = true;
+      }
+      if (isPostprocess) {
+        console.log(`[postprocess] ${line}`);
+      } else {
+        console.log(`[yt-dlp] ${line}`);
+      }
+    });
+
+    if (wroteProgress || stream.download.percent) {
+      console.log(''); // newline after progress
       wroteProgress = false;
     }
-    const isPostprocess = POSTPROCESS_MARKERS.some((marker) => line.includes(marker));
-    if (isPostprocess && !postprocessAnnounced) {
-      console.log('[stage] Post-processing/remuxing...');
-      postprocessAnnounced = true;
-    }
-    if (isPostprocess) {
-      console.log(`[postprocess] ${line}`);
-    } else {
-      console.log(`[yt-dlp] ${line}`);
-    }
-  });
 
-  if (wroteProgress || stream.download.percent) {
-    console.log(''); // newline after progress
+    if (result.success) {
+      break;
+    }
+
+    const isFileLock = /WinError 32|being used by another process|EBUSY|EPERM|Broken pipe/i.test(result.error || '');
+    if (!isFileLock || attempt === options.postprocessRetries) {
+      break;
+    }
+  }
+
+  // Final check: some yt-dlp file lock errors leave a perfect MP4 anyway.
+  if (!result.success) {
+    const existsFinal = await fileExistsWithSize(outputFile);
+    if (existsFinal) {
+      console.log(`[download] yt-dlp failed but valid file found: ${outputFile}`);
+      result.success = true;
+    }
   }
 
   if (result.success) {
@@ -1988,9 +2082,193 @@ async function downloadStreamWithYtDlp(job) {
 
     console.log(`[download] FAIL ${title}: ${errMsg}`);
     stream.download.status = 'failed';
-    stream.download.error = errMsg;
+    
+    stream.download.error = Array.isArray(stream.download.error) ? stream.download.error : [];
+    stream.download.error.push(errMsg);
+    
     await saveVideosState();
     return 'failed';
+  }
+}
+
+async function getFilesRecursively(dir) {
+  let results = [];
+  try {
+    const list = await readdir(dir, { withFileTypes: true });
+    for (const file of list) {
+      const res = path.join(dir, file.name);
+      if (file.isDirectory()) {
+        results = results.concat(await getFilesRecursively(res));
+      } else {
+        results.push(res);
+      }
+    }
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err;
+  }
+  return results;
+}
+
+async function cleanTempFilesFlow() {
+  logClean(`\n[clean] Scanning ${options.downloadsDir} for temporary yt-dlp files...`);
+  const allFiles = await getFilesRecursively(options.downloadsDir);
+  
+  const tempPatterns = ['.temp.mp4', '.part', '.ytdl', '.frag'];
+  const isTempFile = (file) => tempPatterns.some(ext => file.endsWith(ext) || file.includes('.part-') || file.endsWith('.mp4.ytdl') || file.endsWith('.mp4.part'));
+  
+  const tempFiles = allFiles.filter(isTempFile);
+  
+  if (tempFiles.length === 0) {
+    logClean('[clean] No temporary files found.');
+    return;
+  }
+
+  logClean(`[clean] Found ${tempFiles.length} temporary file(s):`);
+  tempFiles.forEach(f => logDetail(`  - ${f}`));
+
+  if (!options.cleanForce) {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    const answer = await rl.question('\nDelete these files? (Y/n) ');
+    rl.close();
+    if (answer.trim().toLowerCase() === 'n') {
+      logClean('[clean] Aborted.');
+      return;
+    }
+  }
+
+  let deleted = 0;
+  for (const f of tempFiles) {
+    try {
+      await unlink(f);
+      deleted++;
+    } catch (e) {
+      logError(`[error] Failed to delete ${f}: ${e.message}`);
+    }
+  }
+  
+  logClean(`[clean] Successfully deleted ${deleted} file(s).`);
+}
+
+async function verifyDownloadsFlow() {
+  videosState = await loadVideosState();
+  if (!videosState || (!videosState.modules && !videosState.lessons)) {
+    logError(`[error] Failed to load metadata from ${options.videosFile}. File may be missing or empty.`);
+    return;
+  }
+
+  logClean(`\n[verify] Scanning expected downloads...`);
+  const jobs = collectDownloadJobs(videosState);
+  
+  const expectedPaths = new Map();
+  const reportDetails = [];
+  
+  let valid = 0, incomplete = 0, corrupt = 0, orphan = 0, totalBytes = 0;
+  const missingFiles = [];
+
+  for (const job of jobs) {
+    const stream = job.stream;
+    const outputFile = buildDownloadOutputPath(job);
+    expectedPaths.set(outputFile, job);
+    
+    let fileStat = null;
+    try {
+      fileStat = await stat(outputFile);
+    } catch (e) { }
+
+    const exists = !!fileStat;
+    const size = exists ? fileStat.size : 0;
+    
+    let statusAfter = 'incomplete';
+    if (exists && size > 0) {
+      if (stream.download?.status === 'completed') statusAfter = 'valid';
+      else statusAfter = 'orphan';
+    } else if (exists && size === 0) {
+      statusAfter = 'corrupt';
+    } else if (stream.download?.status === 'completed') {
+      statusAfter = 'incomplete';
+    }
+    
+    if (statusAfter === 'valid') valid++;
+    if (statusAfter === 'incomplete') { incomplete++; missingFiles.push(outputFile); }
+    if (statusAfter === 'corrupt') { corrupt++; missingFiles.push(outputFile); }
+    if (statusAfter === 'orphan') orphan++;
+    
+    if (exists && size > 0) totalBytes += size;
+    
+    reportDetails.push({
+      moduleTitle: job.moduleTitle,
+      lessonTitle: job.lessonTitle,
+      videoTitle: stream.videoTitle || stream.title,
+      status_before: stream.download?.status || 'none',
+      status_after: statusAfter,
+      outputFile,
+      fileSize: size,
+      notes: ''
+    });
+  }
+  
+  const allFiles = await getFilesRecursively(options.downloadsDir);
+  const extraFiles = [];
+  const tempFiles = [];
+  
+  const tempPatterns = ['.temp.mp4', '.part', '.ytdl', '.frag'];
+  const isTempFile = (file) => tempPatterns.some(ext => file.endsWith(ext) || file.includes('.part-') || file.endsWith('.mp4.ytdl') || file.endsWith('.mp4.part'));
+  
+  for (const file of allFiles) {
+    if (isTempFile(file)) {
+      tempFiles.push(file);
+    } else if (file.endsWith('.mp4') && !expectedPaths.has(file)) {
+      extraFiles.push(file);
+    }
+  }
+  
+  const existingCount = valid + orphan;
+  
+  logClean(`[verify] Expected streams: ${jobs.length}`);
+  logClean(`[verify] Existing MP4s: ${existingCount}`);
+  logClean(`[verify] Missing MP4s: ${incomplete + corrupt}`);
+  logClean(`[verify] Extra MP4s: ${extraFiles.length}`);
+  logClean(`[verify] Temp leftovers: ${tempFiles.length}`);
+  logClean(`[verify] Total size: ${formatBytes(totalBytes)}`);
+
+  if (missingFiles.length > 0) logDetail(`[verify] Missing files:\n  ${missingFiles.join('\n  ')}`);
+  if (extraFiles.length > 0) logDetail(`[verify] Extra files:\n  ${extraFiles.join('\n  ')}`);
+  if (tempFiles.length > 0) logDetail(`[verify] Temp leftovers:\n  ${tempFiles.join('\n  ')}`);
+
+  if (options.reportFile) {
+    const reportData = {
+      timestamp: toWIB(),
+      summary: {
+        total: jobs.length,
+        valid,
+        incomplete,
+        corrupt,
+        orphan,
+        missing_metadata: jobs.filter(j => !j.stream.download?.status).length
+      },
+      details: reportDetails
+    };
+
+    const isMd = options.reportFile.endsWith('.md');
+    let content = '';
+    if (isMd) {
+      content = `# Download Report\nGenerated At: ${reportData.timestamp}\n\n`;
+      content += `- **Expected Streams:** ${jobs.length}\n`;
+      content += `- **Existing MP4s:** ${existingCount}\n`;
+      content += `- **Missing MP4s:** ${incomplete + corrupt}\n`;
+      content += `- **Extra MP4s:** ${extraFiles.length}\n`;
+      content += `- **Temp Leftovers:** ${tempFiles.length}\n`;
+      content += `- **Total Size:** ${formatBytes(totalBytes)}\n\n`;
+    } else {
+      content = JSON.stringify(reportData, null, 2);
+    }
+
+    try {
+      await writeFile(options.reportFile, content, 'utf8');
+      logClean(`\n[verify] Report written to ${options.reportFile}`);
+    } catch (e) {
+      logError(`[error] Failed to write report: ${e.message}`);
+    }
   }
 }
 

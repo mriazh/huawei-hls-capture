@@ -22,3 +22,5 @@ urls*.log
 *.backup.json
 prompt_for_gemini.md
 videos-fixed.json
+*report.json
+*report.md
